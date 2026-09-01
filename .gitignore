@@ -1,14 +1,49 @@
-__pycache__/
-*.pyc
+# Workspace-generated files
 .pytest_cache/
-src/*.egg-info/
-build/
-dist/
-.venv/
-venv/
+__pycache__/
+*.py[cod]
 
-# experiment outputs (keep curated results out of version control
-# or commit them deliberately from results/)
-results/
-traces/
-*.jsonl
+# Local credentials / configuration
+.env
+.env.*
+!.env.example
+model_configs.json
+model_configs.local.json
+
+# Thesis / paper
+paper_gpt/
+
+# AI/development notes
+.claude/
+CLAUDE.md
+CHANGES_EXPERIMENT.md
+
+# Development/test-only package content
+aicomputing/tests/
+aicomputing/docs/
+aicomputing/smoke_test.py
+
+# Development / obsolete experiment utilities
+scripts/debug_raw.py
+scripts/ollama_diagnostic.py
+scripts/run_quick_benchmarks.py
+scripts/run_evaluation.py
+scripts/make_tables.py
+
+# Legacy benchmark outside the final experiment
+aicomputing/benchmarks/hotpotqa_oracle.py
+
+# Local finalized-run manifest
+manifests/pilot-v2-run.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local project exports
+*.zip
+
+# Local re-root backup files
+pre-reroot-*
