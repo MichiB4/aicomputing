@@ -599,26 +599,6 @@ python scripts/run_experiment.py \
   --manifest manifests/pilot-v2-run.json
 ```
 
-### 4. Build and run the main manifest
-
-```bash
-python scripts/make_manifest.py \
-  --preset main \
-  --model-configs model_configs.json \
-  --out manifests/main-v1-run.json
-
-python scripts/verify_experiment.py \
-  --manifest manifests/main-v1-run.json
-
-python scripts/run_experiment.py \
-  --manifest manifests/main-v1-run.json \
-  --dry-run
-
-python scripts/run_experiment.py \
-  --manifest manifests/main-v1-run.json
-```
-
-Debug runs may opt out of the frozen-model requirement explicitly, but such runs are not considered manifest-reproducible and should not be reported as final experimental results.
 
 ---
 
@@ -701,8 +681,8 @@ workspace/
 ├── scripts/                     # manifest, experiment, analysis scripts
 ├── manifests/                   # frozen benchmark selections
 ├── data/
-│   └── mbpp_plus_ground_truth.json
-└── CHANGES_EXPERIMENT.md        # methodological change log
+    └── mbpp_plus_ground_truth.json
+
 ```
 
 Before archival/public release, these components should be versioned together so that an experimental result points to the exact runtime, scripts, manifest, and frozen ground-truth artifact that produced it.
@@ -727,13 +707,6 @@ Implemented:
 - generate-then-execute baseline for the core programming benchmarks;
 - automated tests and offline experiment verification.
 
-Remaining before the final empirical evaluation:
-
-1. select and verify the final model/provider configurations;
-2. freeze those configurations into the pilot manifest;
-3. run pilot-v2 and inspect for provider/model-specific issues;
-4. freeze and execute the main experiment;
-5. aggregate results and complete the empirical analysis.
 
 ---
 
