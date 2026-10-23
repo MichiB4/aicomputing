@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Dict
 
 from .base import Backend, GenerateResponse, ToolUseDetected, detect_tool_use
+from .reasoning import ReasoningCapabilities
 from .ollama import OllamaBackend
 from .hf import HFBackend
 from .openai_compat import OpenAICompatBackend
@@ -12,6 +13,7 @@ from .openai_compat import OpenAICompatBackend
 __all__ = [
     "Backend",
     "GenerateResponse",
+    "ReasoningCapabilities",
     "ToolUseDetected",
     "detect_tool_use",
     "OllamaBackend",

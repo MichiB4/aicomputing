@@ -1,358 +1,257 @@
-"""
-Parsing and type coercion for AI model outputs.
+"""Recover model predictions from response envelopes, literals, or plain text.
 
-Handles: JSON extraction, Python literal parsing, bare scalars,
-and type coercion to the declared return type.
+A dictionary whose sole key is "result" is treated as an envelope. Other
+objects are preserved as values. Embedded containers are decoded whole;
+nested fragments of malformed containers are never selected as answers.
 """
 
 from __future__ import annotations
 
 import ast
 import json
-import re
+import math
 from dataclasses import dataclass
-from typing import Any, Optional
-
-
-def extract_json_result(text: str) -> Any:
-    """
-    Extract the predicted value from JSON embedded in *text*.
-
-    Priority:
-    1. Look for {"result": ...} — our standard format
-    2. Fall back to any single-key JSON object (e.g. {"groups": [...]})
-    3. Fall back to any JSON object and return its first value
-
-    Returns a sentinel _MISSING (not None) when extraction fails,
-    so we can distinguish "result is None" from "no result found".
-    """
-    # Collect all JSON objects in the text
-    all_candidates = []
-
-    # Strategy 1: flat JSON objects
-    for m in re.finditer(r"\{[^{}]*\}", text):
-        all_candidates.append(m.group(0))
-
-    # Strategy 2: nested JSON objects
-    for m in re.finditer(r"\{[\s\S]*\}", text):
-        chunk = m.group(0)
-        if chunk not in all_candidates:
-            all_candidates.append(chunk)
-
-    # First pass: look for "result" key specifically
-    result_candidates = [c for c in all_candidates
-                         if '"result"' in c or "'result'" in c]
-    result_candidates.sort(key=len)
-    for cand in result_candidates:
-        val = _try_parse_json_obj(cand, key="result")
-        if val is not _MISSING:
-            return val
-
-    # Second pass: any parseable JSON object — take the first value
-    all_candidates.sort(key=len)
-    for cand in all_candidates:
-        val = _try_parse_any_json_value(cand)
-        if val is not _MISSING:
-            return val
-
-    return _MISSING
+from typing import Any, Iterator, Optional, get_args, get_origin
 
 
 class _MissingSentinel:
-    """Sentinel to distinguish 'no result found' from 'result is None'."""
-    def __repr__(self):
+    """Distinguish missing recovery from a successfully recovered None."""
+
+    def __repr__(self) -> str:
         return "<MISSING>"
-    def __bool__(self):
+
+    def __bool__(self) -> bool:
         return False
 
+
 _MISSING = _MissingSentinel()
+_COERCION_ERRORS = (ValueError, TypeError, OverflowError)
 
 
-def _try_parse_json_obj(text: str, key: str = "result") -> Any:
-    """Try to parse a JSON object and extract a specific key."""
-    for attempt in [text, text.replace("'", '"')]:
-        try:
-            obj = json.loads(attempt)
-            if isinstance(obj, dict) and key in obj:
-                return obj[key]
-        except (json.JSONDecodeError, ValueError):
-            pass
+def _strip_code_fences(text: str) -> str:
+    """Strip outer whitespace and one complete bare/python/json fence block."""
+    cleaned = text.strip()
+    lines = cleaned.splitlines(keepends=True)
+    if not lines or lines[0].strip() not in ("```", "```python", "```json"):
+        return cleaned
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "```":
+            if index == len(lines) - 1:
+                return "".join(lines[1:index]).strip()
+            break
+    return cleaned
 
-    # Try ast.literal_eval (handles Python dict syntax: {'result': [1,2,3]})
+
+def _decode_literal(text: str) -> Any:
+    """Decode one complete JSON value or Python literal without executing code."""
     try:
-        obj = ast.literal_eval(text)
-        if isinstance(obj, dict) and key in obj:
-            return obj[key]
-    except (ValueError, SyntaxError):
+        return json.loads(text)
+    except ValueError:
         pass
-
-    return _MISSING
-
-
-def _try_parse_any_json_value(text: str) -> Any:
-    """
-    Parse a JSON object and return its first (or only) value.
-    Handles cases where the model uses a key other than "result",
-    e.g. {"groups": [...]} or {"answer": 42}.
-    """
-    for attempt in [text, text.replace("'", '"')]:
-        try:
-            obj = json.loads(attempt)
-            if isinstance(obj, dict) and len(obj) == 1:
-                return next(iter(obj.values()))
-            # If multiple keys, still try — return the first value
-            if isinstance(obj, dict) and obj:
-                return next(iter(obj.values()))
-        except (json.JSONDecodeError, ValueError):
-            pass
-
     try:
-        obj = ast.literal_eval(text)
-        if isinstance(obj, dict) and obj:
-            return next(iter(obj.values()))
-    except (ValueError, SyntaxError):
-        pass
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError, TypeError):
+        return _MISSING
 
-    return _MISSING
+
+def _unwrap_result(value: Any) -> Any:
+    """Unwrap a result-only envelope; preserve other dictionaries."""
+    if isinstance(value, dict) and len(value) == 1 and "result" in value:
+        return value["result"]
+    return value
+
+
+def _container_spans(text: str) -> Iterator[str]:
+    """Locate outer object/array spans, respecting nested brackets and strings.
+
+    This identifies boundaries only; JSON/Python decoders validate syntax.
+    An incomplete final span is yielded whole so it cannot be replaced by
+    a parseable inner fragment or an earlier example.
+    """
+    start: Optional[int] = None
+    stack: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    skip_until = 0
+    closing = {"}": "{", "]": "[", ")": "("}
+
+    for index, char in enumerate(text):
+        if index < skip_until:
+            continue
+        if start is None:
+            if char in "{[":
+                start = index
+                stack = [char]
+            continue
+
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif text.startswith(quote, index):
+                skip_until = index + len(quote)
+                quote = None
+            continue
+
+        if char in ("'", '\"'):
+            quote = char * 3 if text.startswith(char * 3, index) else char
+            skip_until = index + len(quote)
+        elif char in "{[(":
+            stack.append(char)
+        elif char in "}])":
+            if not stack or stack[-1] != closing[char]:
+                # A malformed outer container cannot supply an inner answer.
+                yield text[start:]
+                return
+            stack.pop()
+            if not stack:
+                yield text[start:index + 1]
+                start = None
+
+    if start is not None:
+        yield text[start:]
+
+
+def _recover_structured(
+    text: str,
+    *,
+    unwrap_result: bool = True,
+) -> tuple[Any, Optional[str]]:
+    """Decode a whole response, or its last outer container in prose."""
+    value = _decode_literal(text)
+    if value is not _MISSING:
+        return (_unwrap_result(value) if unwrap_result else value), None
+
+    found = False
+    value = _MISSING
+    error = None
+    for candidate in _container_spans(text):
+        found = True
+        decoded = _decode_literal(candidate)
+        if decoded is _MISSING:
+            value = _MISSING
+            error = "malformed or incomplete structured answer"
+        else:
+            value = _unwrap_result(decoded) if unwrap_result else decoded
+            error = None
+
+    if found:
+        return value, error
+    return _MISSING, None
+
+
+def extract_json_result(text: str) -> Any:
+    """Recover a complete value or result envelope; return _MISSING on failure.
+
+    Supports JSON and Python literals. Bare dictionaries are preserved.
+    When prose contains multiple outer containers, the last one is used.
+    """
+    value, _ = _recover_structured(_strip_code_fences(text))
+    return value
 
 
 def parse_python_literal(text: str) -> Any:
-    """
-    Safely parse a Python literal from text.
-    Handles: ints, floats, strings, bools, None, lists, dicts, tuples.
-    """
-    s = text.strip()
+    """Recover a literal or scalar, otherwise return cleaned text."""
+    cleaned = _strip_code_fences(text)
+    value = _decode_literal(cleaned)
+    if value is not _MISSING:
+        return value
 
-    # Strip markdown code fences
-    s = re.sub(r"^```(?:python|json)?\s*", "", s)
-    s = re.sub(r"\s*```$", "", s)
-    s = s.strip()
-
-    try:
-        return ast.literal_eval(s)
-    except (ValueError, SyntaxError):
-        pass
-
-    # Common barewords
-    lower = s.lower()
-    if lower == "none" or lower == "null":
+    lower = cleaned.lower()
+    if lower in ("none", "null"):
         return None
     if lower == "true":
         return True
     if lower == "false":
         return False
-
-    # Numeric
     try:
-        if "." in s or "e" in s.lower():
-            return float(s)
-        return int(s)
+        if "." in cleaned or "e" in lower:
+            return float(cleaned)
+        return int(cleaned)
     except ValueError:
-        pass
-
-    # Return as string if nothing else works
-    return s
-
-
-# Raised by the numeric/container coercions below when a value cannot be
-# converted. OverflowError is the one that matters in practice: json.loads
-# accepts the bare tokens Infinity / -Infinity / NaN, and a model emitting
-# {"result": Infinity} against a `-> int` signature makes int(inf) raise
-# OverflowError — which is neither a ValueError nor a TypeError, so nothing
-# upstream caught it and it aborted the entire run.
-_COERCION_ERRORS = (ValueError, TypeError, OverflowError)
+        return cleaned
 
 
 def coerce_type(value: Any, target: Any, *, strict: bool = False) -> Any:
-    """
-    Best-effort coercion of *value* to *target* type.
+    """Apply the agreed limited conversions; validate the result separately.
 
-    Total by contract: returns the coerced value, or the original value if
-    coercion is not possible. This function must never raise — it is called
-    from runtime.execute outside any try/except (runtime.py), so an exception
-    here propagates out of VirtualRuntime.execute and aborts the caller's
-    whole run rather than being recorded as one bad prediction.
-
-    Coercion modes
-    --------------
-    strict=False (WARN / library)
-        Repairs output into the declared type where it plausibly can:
-        "5" -> 5, "yes" -> True, 3.7 -> 3.
-
-    strict=True (the experiment)
-        Only conversions that PRESERVE MEANING are applied - list -> tuple,
-        int -> float, and float -> int when the float is exactly integral.
-        Anything that would invent a value is left alone so that structural
-        validation rejects it.
-
-        This matters for what STRICT is supposed to assert. If the runtime
-        repaired 3.7 into 3, or read "yes" as True, then a passing structural
-        check would mean "the runtime managed to make this fit", not "the
-        model returned something structurally compatible" - and the
-        distinction is the whole point of the strict condition.
+    Conversion rules are identical under WARN and STRICT. The strict keyword
+    remains accepted for compatibility with existing callers.
+    Unsupported or unsuccessful conversions retain the original value.
+    Dictionary keys and sets are never coerced, avoiding entry loss.
     """
     if target is None or target is Any:
         return value
 
-    # Handle generic origins
-    from typing import get_origin, get_args
-    origin = get_origin(target)
-
-    # Container coercions can fail on unhashable elements (a model returning
-    # [[1],[2]] for a set[int]); fall back to the original value rather than
-    # letting the TypeError escape.
+    container = get_origin(target) or target
+    args = get_args(target)
     try:
-        if origin is list and isinstance(value, (list, tuple)):
-            args = get_args(target)
+        if container is list and isinstance(value, (list, tuple)):
             if args:
-                return [coerce_type(v, args[0], strict=strict) for v in value]
+                return [coerce_type(item, args[0]) for item in value]
             return list(value)
 
-        if origin is dict and isinstance(value, dict):
-            args = get_args(target)
-            if len(args) >= 2:
-                return {coerce_type(k, args[0], strict=strict):
-                        coerce_type(v, args[1], strict=strict)
-                        for k, v in value.items()}
-            return dict(value)
-
-        # Tuple — JSON has no tuple type, so models return lists.
-        # Convert list → tuple when the return type expects a tuple.
-        if origin is tuple and isinstance(value, (list, tuple)):
-            args = get_args(target)
+        if container is tuple and isinstance(value, (list, tuple)):
+            if len(args) == 2 and args[1] is Ellipsis:
+                return tuple(coerce_type(item, args[0]) for item in value)
             if args:
-                if len(args) == 2 and args[1] is Ellipsis:
-                    return tuple(coerce_type(v, args[0], strict=strict) for v in value)
-                return tuple(coerce_type(v, t, strict=strict) for v, t in zip(value, args))
+                if len(value) != len(args):
+                    return value
+                return tuple(
+                    coerce_type(item, item_type)
+                    for item, item_type in zip(value, args)
+                )
             return tuple(value)
 
-        if origin is set and isinstance(value, (list, tuple, set)):
-            args = get_args(target)
-            if args:
-                return {coerce_type(v, args[0], strict=strict) for v in value}
-            return set(value)
+        if container is dict and isinstance(value, dict):
+            if len(args) >= 2:
+                return {
+                    key: coerce_type(item, args[1])
+                    for key, item in value.items()
+                }
+            return value
+
+        if target is bool and isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+            return value
+
+        # bool inherits int, but is not an allowed numeric conversion.
+        if isinstance(value, bool):
+            return value
+
+        if target is int:
+            if isinstance(value, str):
+                return int(value)
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+
+        if target is float:
+            if isinstance(value, int):
+                converted = float(value)
+                return converted if converted == value else value
+            if isinstance(value, str):
+                converted = float(value)
+                return converted if math.isfinite(converted) else value
     except _COERCION_ERRORS:
         return value
 
-    # Plain types: int, float, str, bool, tuple
-    if isinstance(target, type):
-        # Plain tuple (not Tuple[int, int]) — convert list → tuple.
-        # Representation-level: JSON has no tuple, so a model that returns the
-        # right sequence has no way to express it. Meaning is preserved.
-        if target is tuple and isinstance(value, (list, tuple)):
-            return tuple(value)
-
-        if isinstance(value, target):
-            return value
-
-        # Allow int where float is expected (standard Python widening; exact).
-        if target is float and isinstance(value, int) and not isinstance(value, bool):
-            return float(value)
-
-        # float -> int only when the float is exactly integral. 3.0 -> 3 keeps
-        # the value; 3.7 -> 3 invents one, so it is refused under STRICT and
-        # left for validation to reject. See _strict_ok below.
-        if target is int and isinstance(value, float):
-            if value.is_integer():
-                try:
-                    return int(value)
-                except _COERCION_ERRORS:
-                    pass
-            elif strict:
-                return value            # let validation call it a type failure
-
-        if not strict:
-            # ---- WARN-only repairs -------------------------------------
-            # These change the value's meaning, or read intent out of text.
-            # Useful for interactive and library use, where a nearly-right
-            # answer beats an exception. Never used in the experiment: under
-            # STRICT they would let the runtime manufacture compatibility
-            # that the model did not actually produce.
-            if target is float and isinstance(value, str):
-                try:
-                    return float(value)
-                except _COERCION_ERRORS:
-                    pass
-            if target is int and isinstance(value, (float, str)):
-                try:
-                    return int(value)
-                except _COERCION_ERRORS:
-                    pass
-            if target is bool:
-                if isinstance(value, str):
-                    return value.lower() in ("true", "1", "yes")
-                try:
-                    return bool(value)
-                except _COERCION_ERRORS:
-                    return value
-
-        if target is str and not strict:
-            # WARN only. str(value) is lossless as a mapping but it is not
-            # meaning-preserving as a TYPE claim: turning True into "True"
-            # because the signature says -> str reports a boolean answer as a
-            # string one, and STRICT would then pass a value the model never
-            # produced in that form.
-            try:
-                return str(value)
-            except _COERCION_ERRORS:
-                return value
-
-        if target is bool and isinstance(value, bool):
-            return value
-
     return value
-
-
-def parse_result(text: str, return_type: Optional[Any] = None,
-                 *, strict: bool = False) -> Any:
-    """
-    Parse model output text into a Python value.
-
-    1. Try JSON extraction ({"result": ...})
-    2. Try ast.literal_eval on the whole text (or last line)
-    3. Fall back to scalar parsing
-    4. Optionally coerce to return_type
-
-    Delegates to parse_result_detailed() and discards the status, so the two
-    cannot drift apart. Use parse_result_detailed() when you need to know
-    whether the value came from a structured form or from the raw-text
-    fallback.
-    """
-    return parse_result_detailed(text, return_type, strict=strict).value
-
-
-# ---------------------------------------------------------------------------
-# Parse reporting
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ParseOutcome:
-    """
-    A parsed value plus how it was obtained.
+    """Recovered value, parsing path, and optional diagnostic.
 
-    parse_result() is deliberately permissive: when nothing structured can be
-    recovered it returns the cleaned text as a string. That is the right
-    behaviour for benchmarks whose answers really are strings (BBH, HotpotQA),
-    but it means a malformed response and a legitimate one-word answer are
-    indistinguishable downstream -- garbage is scored as an ordinary wrong
-    answer, and the model looks capable-but-wrong rather than unparseable.
-
-    The status says which path produced the value:
-
-      "parsed"           recovered from a structured form the prompt asked
-                         for: {"result": ...}, or a bare Python/JSON literal.
-      "fallback_parsed"  no structured form was found; the cleaned text is
-                         being returned as a string. Legitimate for a
-                         string-valued specification, suspicious otherwise.
-      "failed"           nothing at all could be recovered (empty response).
-
-    This is metadata, not a verdict. A "fallback_parsed" string answer to a
-    `-> str` signature is perfectly normal, so nothing here decides
-    correctness on its own.
+    Values may already be coerced. Status does not establish type validity
+    or semantic correctness. None can be a successfully parsed value.
     """
 
     value: Any
-    status: str                      # "parsed" | "fallback_parsed" | "failed"
+    status: str
     error: Optional[str] = None
 
     PARSED = "parsed"
@@ -360,55 +259,66 @@ class ParseOutcome:
     FAILED = "failed"
 
 
-def parse_result_detailed(text: str, return_type: Optional[Any] = None,
-                          *, strict: bool = False) -> ParseOutcome:
-    """
-    parse_result(), but reporting how the value was obtained.
+def parse_result_detailed(
+    text: str,
+    return_type: Optional[Any] = None,
+    *,
+    strict: bool = False,
+    unwrap_result: bool = True,
+) -> ParseOutcome:
+    """Recover a prediction and optionally coerce it to the expected type.
 
-    Structured recovery is attempted exactly as parse_result does; the two
-    stay in step because this function performs the recovery and
-    parse_result() delegates to it.
+    Whole-response literals take precedence over embedded containers.
+    Embedded containers are considered in order, with the last one selected.
+    Malformed selected containers fail rather than exposing inner fragments.
+    Without containers, the last non-empty line may supply a literal answer;
+    otherwise scalar recovery or whole-text fallback is used.
+
+    The strict keyword remains accepted for compatibility; conversion rules
+    are identical under WARN and STRICT.
+
+    Set unwrap_result=False to preserve a complete response object, such as
+    a contract verdict containing both "verdict" and "result" fields.
     """
-    if not text or not text.strip():
+    cleaned = _strip_code_fences(text)
+    if not cleaned:
         return ParseOutcome(None, ParseOutcome.FAILED, "empty response")
 
-    coerce = lambda v: (coerce_type(v, return_type, strict=strict)
-                        if return_type is not None else v)
+    value, error = _recover_structured(cleaned, unwrap_result=unwrap_result)
+    if error is not None:
+        return ParseOutcome(None, ParseOutcome.FAILED, error)
+    if value is not _MISSING:
+        return ParseOutcome(
+            coerce_type(value, return_type, strict=strict),
+            ParseOutcome.PARSED,
+        )
 
-    # 1. {"result": ...} or any single-key JSON object.
-    val = extract_json_result(text)
-    if val is not _MISSING:
-        return ParseOutcome(coerce(val), ParseOutcome.PARSED)
+    # With no structured container, try the final non-empty line as a literal.
+    last_line = next(line.strip() for line in reversed(cleaned.splitlines()) if line.strip())
+    value = _decode_literal(last_line)
+    if value is not _MISSING:
+        return ParseOutcome(
+            coerce_type(value, return_type, strict=strict),
+            ParseOutcome.PARSED,
+        )
 
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:python|json)?\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    cleaned = cleaned.strip()
+    value = parse_python_literal(cleaned)
+    fallback = isinstance(value, str) and value == cleaned
+    return ParseOutcome(
+        coerce_type(value, return_type, strict=strict),
+        ParseOutcome.FALLBACK if fallback else ParseOutcome.PARSED,
+        "no structured value found; returned cleaned text" if fallback else None,
+    )
 
-    # 2. A bare literal, whole-text then last meaningful line.
-    try:
-        return ParseOutcome(coerce(ast.literal_eval(cleaned)), ParseOutcome.PARSED)
-    except (ValueError, SyntaxError):
-        pass
 
-    for line in reversed(cleaned.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            return ParseOutcome(coerce(ast.literal_eval(line)), ParseOutcome.PARSED)
-        except (ValueError, SyntaxError):
-            pass
-        line_val = extract_json_result(line)
-        if line_val is not _MISSING:
-            return ParseOutcome(coerce(line_val), ParseOutcome.PARSED)
-        break
+def parse_result(
+    text: str,
+    return_type: Optional[Any] = None,
+    *,
+    strict: bool = False,
+) -> Any:
+    """Return the recovered value, discarding parsing status and diagnostics.
 
-    # 3. Scalar fallback. parse_python_literal still recognises barewords
-    #    (none/true/false) and numerics, which count as parsed; anything else
-    #    comes back as the raw string and is reported as a fallback.
-    val = parse_python_literal(cleaned)
-    status = (ParseOutcome.FALLBACK if isinstance(val, str) and val == cleaned
-              else ParseOutcome.PARSED)
-    error = "no structured value found; returned raw text" if status == ParseOutcome.FALLBACK else None
-    return ParseOutcome(coerce(val), status, error)
+    Use parse_result_detailed() to distinguish valid None from failure.
+    """
+    return parse_result_detailed(text, return_type, strict=strict).value

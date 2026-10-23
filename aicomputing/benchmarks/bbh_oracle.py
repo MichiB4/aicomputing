@@ -20,16 +20,17 @@ Usage:
 
 NOTE (revised experimental design)
 ----------------------------------
-This script is no longer the experiment entry point. It samples with
-`--limit N`, unseeded and without a manifest, so different runs and different
-models can see different items -- which breaks the paired analysis.
+This script is no longer the experiment entry point. `--limit N` takes the
+first N examples per task in dataset order. Paired comparisons require matching
+tasks, data, ordering and limits; this entry point records no manifest.
 
-It is retained because it holds this benchmark's grader (imported by
-benchmarks/adapters.py) and because it reproduces the historical pilot results.
+It retains this benchmark's grader (imported by benchmarks/adapters.py) and
+an ad-hoc entry point. Historical pilot reproduction requires the matching
+code revision and manifest.
 
 For the experiment use:
-    python scripts/run_experiment.py --manifest manifests/main-v1.json ...
-See CHANGES_EXPERIMENT.md.
+    python scripts/run_experiment.py --manifest manifests/main-v2.json ...
+See aicomputing/README.md for manifest configuration and execution.
 """
 
 from __future__ import annotations
@@ -43,7 +44,13 @@ from typing import Any, Dict, List, Optional
 
 from bench_args import (  # adjusts sys.path first
     add_common_args, resolve_args, build_runtime, execute_resilient,
+    configure_system_certificates,
 )
+
+# Configure application HTTPS before importing clients; grader imports stay inert.
+if __name__ == "__main__":
+    configure_system_certificates()
+
 from aicomputing import VirtualRuntime, ExecuteRequest
 
 # Imported lazily rather than at module scope: a missing optional dependency
@@ -145,9 +152,9 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="Limit per task")
     ap.add_argument("--out-csv", default=None)
     args = ap.parse_args()
+    if args.limit is not None and args.limit < 0:
+        ap.error("--limit must be non-negative")
     cfg = resolve_args(args)
-
-    think_override = cfg.think_override
 
     vr = build_runtime(cfg)
 
@@ -165,13 +172,14 @@ def main():
             print(f"  Failed to load: {e}")
             continue
 
-        if args.limit:
+        if args.limit is not None:
             ds = ds.select(range(min(args.limit, len(ds))))
 
         spec = TASK_SPECS.get(task_name, {
             "signature": f"answer(question: str) -> str",
             "docstring": "Answer the question. Return ONLY the answer.",
         })
+        param = spec["signature"].split("(", 1)[1].split(":", 1)[0].strip()
 
         n_correct = 0
         task_results = []
@@ -179,26 +187,35 @@ def main():
         for i, row in enumerate(tqdm(ds, desc=task_name)):
             question = row["input"]
             expected = row["target"]
+            inputs = {param: question}
 
             r = execute_resilient(vr, ExecuteRequest(
                 signature=spec["signature"],
                 docstring=spec["docstring"],
-                inputs={"question": question},
+                inputs=inputs,
                 return_type=str,
                 strategy=cfg.strategy,
-                think=think_override,
                 strict_types=False,
                 max_new_tokens=cfg.max_tokens,
             ), label=f"{task_name}#{i}")
 
             predicted = str(r.result) if r.result is not None else ""
-            correct = normalize_answer(predicted) == normalize_answer(expected)
+            correct = (
+                r.exec_status in (None, "ok")
+                and normalize_answer(predicted) == normalize_answer(expected)
+            )
             pre_rev_correct = (
                 "" if r.revised is None
-                else normalize_answer(str(r.pre_revision_value or "")) == normalize_answer(expected)
+                else normalize_answer(
+                    str(r.pre_revision_value) if r.pre_revision_value is not None else ""
+                ) == normalize_answer(expected)
             )
             if correct: n_correct += 1
 
+            try:
+                pre_revision_json = json.dumps(r.pre_revision_value, default=str)
+            except (TypeError, ValueError):
+                pre_revision_json = json.dumps(str(r.pre_revision_value))
 
             task_results.append({
                 "task_id": f"{task_name}/{i}",
@@ -207,7 +224,7 @@ def main():
                 "signature": spec["signature"],
                 "docstring": spec["docstring"],
                 "input_line": question[:150],
-                "inputs": json.dumps({"question": question}, ensure_ascii=False),
+                "inputs": json.dumps(inputs, ensure_ascii=False),
                 "expected_line": expected,
                 "expected": json.dumps(expected),
                 "raw_text": r.raw_text,
@@ -222,8 +239,9 @@ def main():
                 "exec_status": r.exec_status or "",
                 "pre_revision_correct": pre_rev_correct,
                 "revised": r.revised,
-                "pre_revision_value": json.dumps(r.pre_revision_value, default=str),
+                "pre_revision_value": pre_revision_json,
                 "tokens_used": r.tokens_used,
+                "reasoning_requests": json.dumps(r.reasoning_requests, default=str),
             })
 
         total = len(task_results)
@@ -234,8 +252,9 @@ def main():
     # Overall
     total_correct = sum(1 for r in all_results if r["correct"])
     total = len(all_results)
+    accuracy = total_correct / total if total else 0.0
     print(f"\n{'='*50}")
-    print(f"BBH Overall: {total_correct}/{total} ({total_correct/total:.4f})")
+    print(f"BBH Overall: {total_correct}/{total} ({accuracy:.4f})")
     print()
     for r in all_results[:10]:
         mark = "✓" if r["correct"] else "✗"
@@ -255,6 +274,7 @@ def main():
                 "latency_ms", "tokens_used", "token_retries",
                 "benchmark", "type_warnings", "exec_status",
                 "pre_revision_correct", "revised", "pre_revision_value",
+                "reasoning_requests",
             ])
             for r in all_results:
                 w.writerow([
@@ -268,6 +288,7 @@ def main():
                     f"{r['latency_ms']:.0f}", r["tokens_used"], r["token_retries"],
                     r["benchmark"], r["type_warnings"], r["exec_status"],
                     r["pre_revision_correct"], r["revised"], r["pre_revision_value"],
+                    r["reasoning_requests"],
                 ])
         print(f"Results written to {args.out_csv}")
 

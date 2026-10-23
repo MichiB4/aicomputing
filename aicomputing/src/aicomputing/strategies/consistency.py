@@ -1,45 +1,44 @@
-"""
-Self-consistency strategy (Wang et al., "Self-Consistency Improves Chain of
-Thought Reasoning in Language Models", ICLR 2023).
+"""Self-consistency prediction using repeated structured-CoT samples.
 
-Samples `n_samples` independent structured-CoT traces at a non-zero
-temperature and returns the majority-voted parsed result. Unlike `hybrid`
-and `confidence`, this is a well-established, validated technique from the
-literature rather than a project-specific heuristic — the tradeoff is
-well understood: it costs `n_samples`x the inference calls and latency of
-a single `cot` call in exchange for reduced variance on tasks where the
-model's reasoning is inconsistent from sample to sample.
-
-Each sample reuses the same structured CoT prompt as the `cot` strategy
-so its trace format is directly comparable. `tokens_used` and the
-token-budget-retry count reported on the result are summed across all
-`n_samples` independent calls, not just the winning sample.
+Selects the most frequent recovered value matching the expected return type,
+with ties resolved by first occurrence. Any leaves voting unrestricted.
+None participates when its type is allowed; failed recovery does not vote.
+The selected sample supplies answer text and parsing metadata, while
+usage and token-budget retry counts are accumulated across samples.
+Every sample requests temperature=0.0, regardless of the request setting.
+Native reasoning is configured by the backend rather than selected by
+this strategy.
 """
 
 from __future__ import annotations
 
-import json
-from collections import Counter
 from typing import Any, List, Optional, Tuple
 
-from ..backends.base import Backend, GenerateResponse
+from ..backends.base import Backend
 from ..model_config import get_token_budget
-from ..parsing import parse_result
+from ..parsing import ParseOutcome
 from ..prompting import build_cot_prompt, build_retry_prompt
 from ..request import ExecuteRequest
-from .base import (CallStats, Strategy, StrategyResult,
-                   generate_with_retry, make_parser, _is_strict)
-
-# Self-consistency needs sampling diversity — greedy decoding (temperature=0)
-# would just produce n identical votes. Used only when the caller hasn't
-# requested a specific non-zero temperature.
-_DEFAULT_SAMPLE_TEMPERATURE = 0.7
+from ..validation import validate_output
+from .base import (
+    CallStats,
+    Strategy,
+    StrategyResult,
+    _is_strict,
+    _same_value,
+    generate_with_retry,
+    make_parser,
+)
 
 
 class SelfConsistencyStrategy(Strategy):
-    """Sample `n_samples` CoT traces and return the majority-voted result."""
+    """Sample `n_samples` CoT traces and return the most frequent value."""
 
     def __init__(self, n_samples: int = 5, include_fewshot: bool = True) -> None:
+        if type(n_samples) is not int:
+            raise TypeError("n_samples must be an integer")
+        if n_samples <= 0:
+            raise ValueError("n_samples must be positive")
         self._n_samples = n_samples
         self._include_fewshot = include_fewshot
 
@@ -66,34 +65,29 @@ class SelfConsistencyStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        think = request.think if request.think is not None else True
+        # Preserve the existing default allowance; this does not set native reasoning.
         initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, think,
+            request.model or backend.default_model, extended=True,
         )
-        temperature = (
-            request.temperature if request.temperature > 0
-            else _DEFAULT_SAMPLE_TEMPERATURE
-        )
-
-        psink: dict = {}
-        parse = make_parser(request.return_type, _is_strict(request), psink)
 
         def call(max_new_tokens: int):
             return backend.generate(
                 prompt,
                 model=request.model,
-                temperature=temperature,
+                temperature=0.0,
                 top_p=request.top_p,
                 max_new_tokens=max_new_tokens,
-                think=think,
             )
 
-        # Shared across every sample: the defining cost of this strategy is
-        # that it pays n_samples times, and reporting one sample would erase it.
+        # Accumulate returned-response usage across samples and token retries.
         stats = CallStats()
-        samples: List[Tuple[Any, GenerateResponse, int]] = []
-        budgets: List[int] = []
+        samples: List[StrategyResult] = []
+        strict = _is_strict(request)
         for _ in range(self._n_samples):
+            # A fresh sink prevents another sample from overwriting the
+            # parsing status of the answer eventually selected by voting.
+            psink: dict = {}
+            parse = make_parser(request.return_type, strict, psink)
             value, response, retries, final_budget = generate_with_retry(
                 call=call,
                 parse=parse,
@@ -101,63 +95,75 @@ class SelfConsistencyStrategy(Strategy):
                 model_name=request.model or backend.default_model,
                 stats=stats,
             )
-            samples.append((value, response, retries))
-            budgets.append(final_budget)
+            samples.append(StrategyResult(
+                value=value,
+                raw_text=response.text,
+                tokens_used=response.tokens_used,
+                provider_finish_reason=response.provider_finish_reason,
+                token_budget_used=final_budget,
+                retries=retries,
+                parse_status=psink.get("parse_status"),
+                parse_error=psink.get("parse_error"),
+            ))
 
-        best_value, winning_response, vote_count = _majority_vote(samples)
-        total_tokens = sum(r.tokens_used or 0 for _, r, _ in samples) or None
-        total_retries = sum(retries for _, _, retries in samples)
-        # Samples share a starting budget but may double independently, so
-        # there is no single budget for the call. Report the largest ceiling
-        # requested by any sample — the figure that matters against a
-        # provider's per-request token cap. Consistent with tokens_used and
-        # retries, which aggregate across samples rather than describing the
-        # winning one.
-        max_budget = max(budgets) if budgets else None
+        winner, vote_count = _majority_vote(
+            samples, return_type=request.return_type,
+        )
+        reported_tokens = [
+            sample.tokens_used
+            for sample in samples
+            if sample.tokens_used is not None
+        ]
+        total_tokens = sum(reported_tokens) if reported_tokens else None
+        total_retries = sum(sample.retries for sample in samples)
+        # Report the largest final allowance requested by any sample.
+        max_budget = max(sample.token_budget_used for sample in samples)
 
         return StrategyResult(
-            value=best_value,
-            # One prompt, sampled n_samples times -- recorded once,
-            # because the samples differ by temperature, not by text.
+            value=winner.value,
+            # All samples use this prompt; record it once.
             prompts=[prompt],
             raw_text=(
                 f"[consistency {vote_count}/{self._n_samples}] "
-                f"{winning_response.text}"
+                f"{winner.raw_text}"
             ),
             tokens_used=total_tokens,
-            provider_finish_reason=winning_response.provider_finish_reason,
+            provider_finish_reason=winner.provider_finish_reason,
             token_budget_used=max_budget,
             retries=total_retries,
             call_stats=stats,
-            parse_status=psink.get("parse_status"),
-            parse_error=psink.get("parse_error"),
+            parse_status=winner.parse_status,
+            parse_error=winner.parse_error,
         )
 
 
 def _majority_vote(
-    samples: List[Tuple[Any, GenerateResponse, int]],
-) -> Tuple[Any, GenerateResponse, int]:
-    """
-    Return (value, winning_response, vote_count) for the most common parsed
-    value among the samples. Failed parses (None) are excluded from the
-    vote unless every sample failed, in which case the first failure is
-    returned so the caller still gets a raw_text to inspect.
-    """
-    def vote_key(value: Any) -> str:
-        try:
-            return json.dumps(value, sort_keys=True, default=str)
-        except TypeError:
-            return repr(value)
+    samples: List[StrategyResult],
+    *,
+    return_type: Any = None,
+) -> Tuple[StrategyResult, int]:
+    """Select the most frequent recovered, type-conforming value.
 
-    counted = [(v, r) for v, r, _ in samples if v is not None]
+    Any or None disables type filtering. Ties select the first encountered
+    value. If no sample qualifies, return the first sample with zero votes
+    for diagnostics. Type conformity does not establish correctness.
+    """
+    counted = [
+        sample for sample in samples
+        if sample.parse_status in (ParseOutcome.PARSED, ParseOutcome.FALLBACK)
+        and not validate_output(sample.value, return_type, strict=False)
+    ]
     if not counted:
-        value, response, _ = samples[0]
-        return value, response, 0
+        return samples[0], 0
 
-    counts = Counter(vote_key(v) for v, _ in counted)
-    winning_key, vote_count = counts.most_common(1)[0]
+    groups: List[Tuple[StrategyResult, int]] = []
+    for sample in counted:
+        for index, (representative, count) in enumerate(groups):
+            if _same_value(sample.value, representative.value):
+                groups[index] = (representative, count + 1)
+                break
+        else:
+            groups.append((sample, 1))
 
-    for value, response in counted:
-        if vote_key(value) == winning_key:
-            return value, response, vote_count
-    raise AssertionError("unreachable: winning_key must match a counted sample")
+    # max retains the first group when counts tie.
+    return max(groups, key=lambda group: group[1])

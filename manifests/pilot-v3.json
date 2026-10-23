@@ -1,0 +1,248 @@
+{
+  "manifest_version": 2,
+  "selection_algorithm_version": 4,
+  "experiment_id": "pilot-v3",
+  "created_at": "2026-10-21T19:58:16+00:00",
+  "seed": 42,
+  "validation_mode": "strict",
+  "models": [],
+  "strategies": [
+    "direct",
+    "cot",
+    "pseudocode",
+    "contract",
+    "confidence"
+  ],
+  "baseline": {
+    "name": "code_gen_baseline",
+    "benchmarks": [
+      "humaneval_plus",
+      "mbpp_plus"
+    ]
+  },
+  "generation": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_retries": 1,
+    "max_new_tokens": null
+  },
+  "model_configs": {},
+  "benchmarks": {
+    "humaneval_plus": {
+      "group": "core",
+      "display_name": "humaneval_plus",
+      "subset_note": null,
+      "requested": 5,
+      "selected": 5,
+      "pool_size": 157,
+      "pool_fingerprint": "087c1dc1892701dd",
+      "dataset_revision": null,
+      "invocation_pool_policy": "plus_only",
+      "strata": null,
+      "items": [
+        {
+          "item_id": "HumanEval/0",
+          "invocation_id": "in:241",
+          "content_fingerprint": "48c830e5ac47bff211c84ccb2f664c7d",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "HumanEval/109",
+          "invocation_id": "in:606",
+          "content_fingerprint": "67e3c7c6db945605cf3631f17860f18b",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "HumanEval/13",
+          "invocation_id": "in:888",
+          "content_fingerprint": "2d35aa2fd43ecca0da5302f07eb01303",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "HumanEval/80",
+          "invocation_id": "in:910",
+          "content_fingerprint": "c0e75c008dac88fea1b66b671f0dc247",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "HumanEval/99",
+          "invocation_id": "in:281",
+          "content_fingerprint": "1c46a433081946b0a4ed003ef7391dbe",
+          "invocation_pool": "plus"
+        }
+      ],
+      "content_fingerprints": true
+    },
+    "mbpp_plus": {
+      "group": "core",
+      "display_name": "mbpp_plus",
+      "subset_note": null,
+      "requested": 5,
+      "selected": 5,
+      "pool_size": 375,
+      "pool_fingerprint": "97ab70eb99fca56c",
+      "dataset_revision": null,
+      "invocation_pool_policy": "plus_only",
+      "strata": null,
+      "items": [
+        {
+          "item_id": "Mbpp/145",
+          "invocation_id": "gt:25",
+          "content_fingerprint": "38f0ecc7052b99d669b372e21aee9d0b",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "Mbpp/305",
+          "invocation_id": "gt:79",
+          "content_fingerprint": "ffdbf282b5738f07f0c90edace787ab8",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "Mbpp/477",
+          "invocation_id": "gt:109",
+          "content_fingerprint": "20daf2cb2b27c7f66f9cca672b26fa00",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "Mbpp/568",
+          "invocation_id": "gt:83",
+          "content_fingerprint": "2bc22bfa88bee0540e31b6f7c1ea3c5c",
+          "invocation_pool": "plus"
+        },
+        {
+          "item_id": "Mbpp/65",
+          "invocation_id": "gt:97",
+          "content_fingerprint": "656fbb85ee136730a23d444b12893744",
+          "invocation_pool": "plus"
+        }
+      ],
+      "content_fingerprints": true
+    },
+    "gsm8k": {
+      "group": "generalization",
+      "display_name": "gsm8k",
+      "subset_note": null,
+      "requested": 10,
+      "selected": 10,
+      "pool_size": 1319,
+      "pool_fingerprint": "b019b20536c476d3",
+      "dataset_revision": "0.0.0/415204891c496fb7",
+      "invocation_pool_policy": null,
+      "strata": null,
+      "items": [
+        {
+          "item_id": "gsm8k/1005",
+          "content_fingerprint": "411d43299b2081e8de13aaa2e6854350"
+        },
+        {
+          "item_id": "gsm8k/1205",
+          "content_fingerprint": "b90978a55406bb2e15336e998733b4b7"
+        },
+        {
+          "item_id": "gsm8k/322",
+          "content_fingerprint": "3224618821ed07cc45c939b0dac52038"
+        },
+        {
+          "item_id": "gsm8k/473",
+          "content_fingerprint": "a1dfdc7265db06022eaa0867145de00a"
+        },
+        {
+          "item_id": "gsm8k/57",
+          "content_fingerprint": "64ea2726b8c851131c95c857c7a8e4b1"
+        },
+        {
+          "item_id": "gsm8k/677",
+          "content_fingerprint": "a1d6826a8871d3855340660bc6b16410"
+        },
+        {
+          "item_id": "gsm8k/907",
+          "content_fingerprint": "565f65ecb1dee274af6c07ad351e5e9e"
+        },
+        {
+          "item_id": "gsm8k/935",
+          "content_fingerprint": "3a24afa2ae79626cfcf4a4d5a5e3d936"
+        },
+        {
+          "item_id": "gsm8k/954",
+          "content_fingerprint": "3c83e5b99ff4efa0651697b749629e52"
+        },
+        {
+          "item_id": "gsm8k/998",
+          "content_fingerprint": "47ead24c0bd1606b6b57c409662a0724"
+        }
+      ],
+      "content_fingerprints": true
+    },
+    "bbh": {
+      "group": "generalization",
+      "display_name": "BBH-5",
+      "subset_note": "five configured task variants from BIG-Bench Hard; not the full suite",
+      "requested": 10,
+      "selected": 10,
+      "pool_size": 1250,
+      "pool_fingerprint": "14ba0fa4fe698615",
+      "dataset_revision": "{\"boolean_expressions\": \"0.0.0/ba0f0523c3292900\", \"date_understanding\": \"0.0.0/c9a78425ad2d3fee\", \"logical_deduction_five_objects\": \"0.0.0/de3ea2df4316f4fd\", \"tracking_shuffled_objects_three_objects\": \"0.0.0/938570432fd855e4\", \"web_of_lies\": \"0.0.0/a35a345e112d89e2\"}",
+      "invocation_pool_policy": null,
+      "strata": {
+        "boolean_expressions": 2,
+        "date_understanding": 2,
+        "logical_deduction_five_objects": 2,
+        "tracking_shuffled_objects_three_objects": 2,
+        "web_of_lies": 2
+      },
+      "items": [
+        {
+          "item_id": "boolean_expressions/193",
+          "category": "boolean_expressions",
+          "content_fingerprint": "b56c1318ad734e83ca28ac7b59783825"
+        },
+        {
+          "item_id": "boolean_expressions/229",
+          "category": "boolean_expressions",
+          "content_fingerprint": "233adbeea996caf5e46afde19b2ebe84"
+        },
+        {
+          "item_id": "date_understanding/144",
+          "category": "date_understanding",
+          "content_fingerprint": "f7b0b2c9adbce5f3be60e6e2718e10da"
+        },
+        {
+          "item_id": "date_understanding/96",
+          "category": "date_understanding",
+          "content_fingerprint": "f0f1f9e6d67177ec355feeec067f885e"
+        },
+        {
+          "item_id": "logical_deduction_five_objects/237",
+          "category": "logical_deduction_five_objects",
+          "content_fingerprint": "4c6d969e62104d5ef3c92b11518ea855"
+        },
+        {
+          "item_id": "logical_deduction_five_objects/28",
+          "category": "logical_deduction_five_objects",
+          "content_fingerprint": "1b0c5b386d6fa9e4b449a4c1f093d99f"
+        },
+        {
+          "item_id": "tracking_shuffled_objects_three_objects/149",
+          "category": "tracking_shuffled_objects_three_objects",
+          "content_fingerprint": "4a14288c93dd90a4477c8b00ddfbaa1f"
+        },
+        {
+          "item_id": "tracking_shuffled_objects_three_objects/99",
+          "category": "tracking_shuffled_objects_three_objects",
+          "content_fingerprint": "027bd3bdaa6bc7b33803a86b96609e5f"
+        },
+        {
+          "item_id": "web_of_lies/196",
+          "category": "web_of_lies",
+          "content_fingerprint": "f073dfee51f347e3d0482f6e37c55197"
+        },
+        {
+          "item_id": "web_of_lies/23",
+          "category": "web_of_lies",
+          "content_fingerprint": "3d8d102bb08fa7da81dc5552b61e0a1e"
+        }
+      ],
+      "content_fingerprints": true
+    }
+  }
+}

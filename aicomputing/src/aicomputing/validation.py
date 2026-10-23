@@ -1,72 +1,54 @@
 """
 Runtime type-checking and constraint validation for AI Computing.
 
-Implements the typing rule T-AI from the paper: checks that inputs match
-the declared parameter types and that the model's output matches the
-declared return type.
+Checks inputs against declared parameter types, outputs against expected
+return types, and outputs against caller-supplied constraint predicates.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, get_args, get_origin
 
-from .types import MediaObject, ParsedSignature
+from .types import MediaObject, ParsedSignature, validate_type_annotation
 
 
-# ---------------------------------------------------------------------------
-# Validation policy
-# ---------------------------------------------------------------------------
+# Output validation policy.
 
 class ValidationMode(Enum):
     """
-    What the runtime does with structurally invalid output.
+    How the runtime handles outputs that fail type or constraint validation.
 
     STRICT
-        After the permitted retries are exhausted, output that does not match
-        the declared return type is an EXECUTION FAILURE. The runtime reports
-        no result rather than handing back a value it has already determined
-        does not satisfy the contract. This is the mode the experiment uses:
-        an invocation that yields a malformed value has not executed the
-        specification, and scoring it as an ordinary wrong answer would blur
-        two different events -- see failure_type in the result schema.
+        After the retry loop ends, invalid outputs are withheld. The runtime
+        returns an ExecuteResult with result=None and failure diagnostics
+        rather than raising for these output-validation failures.
 
     WARN
-        Structural problems are recorded as warnings and the value is returned
-        anyway. Appropriate for interactive and library use, where a nearly
-        right answer is more useful than an exception, and it preserves the
-        behaviour callers of this package had before the mode existed.
+        Invalid outputs are returned with warnings and failure diagnostics.
 
-    What this does NOT mean
-    -----------------------
-    Passing STRICT validation says the value has the declared TYPE and shape.
-    It says nothing about whether the value is the right answer. Three
-    distinct properties are kept separate throughout this package:
+    Passing validation means the output passed the applicable checks.
+    It does not establish that the prediction satisfies the specification.
 
-        structural/type validity        checked here, mechanically
-        constraint validity             checked here, mechanically, against
-                                        caller-supplied predicates
-        semantic correctness            NOT checked here. Determined only by
-                                        benchmark ground truth.
-
-    A strategy that self-checks its answer (`contract`) performs model-based
-    semantic self-checking, which is evidence, not verification, and is
-    recorded separately from both of the mechanical checks above.
+    Model-based self-checking is separate from these mechanical checks
+    and does not establish semantic correctness.
     """
 
     STRICT = "strict"
     WARN = "warn"
 
     @classmethod
-    def coerce(cls, value: "ValidationMode | str | bool | None",
-               default: "ValidationMode" = None) -> "ValidationMode":
+    def coerce(
+        cls,
+        value: ValidationMode | str | bool | None,
+        default: ValidationMode | None = None,
+    ) -> ValidationMode:
         """
-        Accept a mode, its name, or the legacy boolean `strict_types` flag.
+        Resolve a mode, string value, or legacy boolean.
 
-        The boolean spelling predates this enum and still reaches the runtime
-        from ExecuteRequest.strict_types and from the CLI, so it is mapped
-        here rather than at each call site.
+        True selects STRICT; False selects WARN.
+        None uses the supplied default, falling back to WARN.
         """
         if value is None:
             return default if default is not None else cls.WARN
@@ -81,25 +63,25 @@ class ValidationMode(Enum):
                 raise ValueError(
                     f"unknown validation mode {value!r}; "
                     f"expected one of {[m.value for m in cls]}"
-                )
+                ) from None
         raise TypeError(f"cannot interpret {value!r} as a ValidationMode")
 
 
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
+# Validation errors.
 
 class AITypeError(TypeError):
     """Raised when inputs or outputs violate the declared types."""
 
 
 class AIConstraintError(ValueError):
-    """Raised when a constraint predicate fails on the model output."""
+    """Represents an output constraint-validation failure."""
 
 
-# ---------------------------------------------------------------------------
-# Type-checking helpers
-# ---------------------------------------------------------------------------
+class UnsupportedMediaInputError(TypeError):
+    """The prediction flow cannot supply a wrapper's content to the model."""
+
+
+# Type-checking helpers.
 
 def _is_media_type(t: Any) -> bool:
     try:
@@ -110,39 +92,47 @@ def _is_media_type(t: Any) -> bool:
 
 def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
     """
-    Check that *value* conforms to *expected* type.
+    Check a value against a supported type annotation.
 
-    Supports: int, float, str, bool, list, dict, tuple, set,
-    generic forms (list[int], dict[str, int]), None, Any,
-    and multimodal types (Image, Audio, Video, Text, MediaObject).
+    Raises AITypeError on a detected mismatch.
+
+    Supports primitive and container types, generic lists, dictionaries,
+    tuples and sets, NoneType, Any, and MediaObject subclasses.
     """
+    validate_type_annotation(expected)
     if expected is Any:
-        return  # anything goes
+        return
 
     origin = get_origin(expected)
 
     # NoneType
     if expected is type(None):
         if value is not None:
-            raise AITypeError(f"{label}: expected None, got {type(value).__name__}")
+            raise AITypeError(
+                f"{label}: expected None, got {type(value).__name__}"
+            )
         return
 
     # Media types
     if _is_media_type(expected):
         if not isinstance(value, expected):
             raise AITypeError(
-                f"{label}: expected {expected.__name__}, got {type(value).__name__}"
+                f"{label}: expected {expected.__name__}, "
+                f"got {type(value).__name__}"
             )
         return
 
-    # Generic: list[X], dict[K,V], tuple[...], set[X]
+    # Inspect generic annotations and validate supported container elements.
     if origin is not None:
         base = origin
-        args = get_args(expected)
+        args = tuple(
+            type(None) if arg is None else arg for arg in get_args(expected)
+        )
 
         if not isinstance(value, base):
             raise AITypeError(
-                f"{label}: expected {base.__name__}[...], got {type(value).__name__}"
+                f"{label}: expected {base.__name__}[...], "
+                f"got {type(value).__name__}"
             )
 
         if base is list and args:
@@ -166,36 +156,70 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
                 for i, item in enumerate(value):
                     check_value_type(item, args[0], label=f"{label}[{i}]")
             else:
+                if len(value) != len(args):
+                    raise AITypeError(
+                        f"{label}: expected tuple of length {len(args)}, "
+                        f"got length {len(value)}"
+                    )
                 for i, (item, t) in enumerate(zip(value, args)):
                     check_value_type(item, t, label=f"{label}[{i}]")
         return
 
-    # Plain types: int, float, str, bool
+    # Ordinary class annotations, including unparameterized containers.
     if isinstance(expected, type):
-        # Python treats bool as a subtype of int, so True would silently
-        # satisfy an int/float contract (and later compare equal to 1).
-        # For a spec-only oracle that hides a real failure: a model
-        # answering "true" to a numeric question looks type-correct.
+        # Reject booleans for numeric requirements despite bool inheriting int.
         if expected in (int, float) and isinstance(value, bool):
             raise AITypeError(
                 f"{label}: expected {expected.__name__}, got bool"
             )
-        # Allow int where float is expected (standard Python widening)
+
+        # Accept integers for float requirements without converting the value.
         if expected is float and isinstance(value, (int, float)):
             return
+
         if not isinstance(value, expected):
             raise AITypeError(
-                f"{label}: expected {expected.__name__}, got {type(value).__name__}"
+                f"{label}: expected {expected.__name__}, "
+                f"got {type(value).__name__}"
             )
         return
 
-    # Fallback: don't raise on things we can't check
+    # None represents an unspecified requirement.
     return
 
 
-# ---------------------------------------------------------------------------
-# Input validation (T-AI rule: Γ ⊢ e : T_in)
-# ---------------------------------------------------------------------------
+# Input validation.
+
+def validate_media_inputs(inputs: Dict[str, Any]) -> None:
+    """Reject MediaObject wrappers, including Text, in nested input containers.
+
+    Inspect dictionary keys and values and list/tuple/set/frozenset contents.
+    Do not inspect arbitrary object attributes or infer media from strings or
+    raw bytes. Track visited containers so cycles do not stall this check.
+    """
+    pending = [inputs]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, MediaObject):
+            raise UnsupportedMediaInputError(
+                "MediaObject wrappers, including Text, are not supported by the "
+                "text-only prediction flow; pass ordinary strings for text inputs."
+            )
+
+        if not isinstance(value, (dict, list, tuple, set, frozenset)):
+            continue
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        else:
+            pending.extend(value)
+
 
 def validate_inputs(
     sig: ParsedSignature,
@@ -203,15 +227,15 @@ def validate_inputs(
     strict: bool = True,
 ) -> List[str]:
     """
-    Validate that *inputs* match the parameter types declared in *sig*.
+    Check supplied argument names and values against a parsed signature.
 
-    Returns a list of warning strings. Raises AITypeError in strict mode
-    on the first mismatch.
+    Returns warning strings in permissive mode.
+    Strict mode raises AITypeError on the first detected mismatch.
     """
     warnings: List[str] = []
     declared_names = {p.name for p in sig.params}
 
-    # Check for missing required params
+    # Check for missing required arguments.
     for p in sig.params:
         if p.name not in inputs and p.default is None:
             msg = f"Missing required input: {p.name!r}"
@@ -219,7 +243,7 @@ def validate_inputs(
                 raise AITypeError(msg)
             warnings.append(msg)
 
-    # Check for unexpected params
+    # Check for unexpected arguments.
     for key in inputs:
         if key not in declared_names:
             msg = f"Unexpected input: {key!r} (not in signature)"
@@ -227,14 +251,16 @@ def validate_inputs(
                 raise AITypeError(msg)
             warnings.append(msg)
 
-    # Type-check each provided input
+    # Type-check each provided argument.
     for p in sig.params:
         if p.name not in inputs:
             continue
-        if p.resolved_type is Any:
-            continue
         try:
-            check_value_type(inputs[p.name], p.resolved_type, label=f"input '{p.name}'")
+            check_value_type(
+                inputs[p.name],
+                p.resolved_type,
+                label=f"input '{p.name}'",
+            )
         except AITypeError as e:
             if strict:
                 raise
@@ -243,9 +269,7 @@ def validate_inputs(
     return warnings
 
 
-# ---------------------------------------------------------------------------
-# Output validation (T-AI rule: result has type T_out)
-# ---------------------------------------------------------------------------
+# Output validation.
 
 def validate_output(
     value: Any,
@@ -253,9 +277,11 @@ def validate_output(
     strict: bool = True,
 ) -> List[str]:
     """
-    Validate that the model's output matches the declared return type.
+    Check an output against an expected type annotation.
 
-    Returns a list of warning strings. Raises AITypeError in strict mode.
+    Any or None disables this check; type(None) requires a None value.
+    Strict mode raises AITypeError on a detected mismatch.
+    Permissive mode returns the mismatch as a warning.
     """
     if return_type is Any or return_type is None:
         return []
@@ -268,13 +294,12 @@ def validate_output(
         return [str(e)]
 
 
-# ---------------------------------------------------------------------------
-# Constraint validation
-# ---------------------------------------------------------------------------
+# Constraint validation.
 
 @dataclass
 class Constraint:
-    """A named predicate that the output must satisfy."""
+    """A named predicate on the output."""
+
     name: str
     predicate: Callable[[Any], bool]
     message: str = ""
@@ -289,18 +314,15 @@ def validate_constraints(
     strict: bool = True,
 ) -> List[str]:
     """
-    Run all constraint predicates against *value*.
+    Check an output using caller-supplied predicates.
 
-    Returns list of failure messages. Raises AIConstraintError in strict mode.
+    Returns failure diagnostics in permissive mode.
+    Strict mode raises AIConstraintError when a predicate returns a false value.
+    Predicate exceptions propagate unchanged in either mode.
     """
     failures: List[str] = []
     for c in constraints:
-        try:
-            ok = c.check(value)
-        except Exception as exc:
-            ok = False
-            failures.append(f"Constraint {c.name!r} raised {exc}")
-            continue
+        ok = c.check(value)
         if not ok:
             msg = c.message or f"Constraint {c.name!r} failed"
             if strict:

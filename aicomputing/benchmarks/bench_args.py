@@ -1,62 +1,53 @@
 """
-Shared argument parsing for AI Computing benchmark scripts.
+Shared argument parsing and runtime construction for benchmark scripts.
 
-Adds a --provider flag that auto-configures base_url for known providers,
-and auto-derives a sensible strategy default from the model name using the
-model registry. Thinking is deliberately NOT auto-derived: each strategy
-declares the condition it needs, and --think/--no-think is the only way to
-override it.
+Provider presets supply default connection settings. The prompting strategy
+defaults to direct, independently of the model name and native reasoning.
+
+Native reasoning overrides are explicit backend settings. Omitting them leaves
+backend defaults unchanged; requesting them does not prove the model uses them.
 
 Usage in a benchmark script::
 
-    from bench_args import add_common_args, resolve_args
+    import argparse
+    from bench_args import (
+        add_common_args, build_runtime, configure_system_certificates, resolve_args,
+    )
+
+    # In the application entry point, before importing HTTPS clients:
+    configure_system_certificates()
 
     ap = argparse.ArgumentParser()
     add_common_args(ap)
-    ap.add_argument("--limit", type=int, default=None)   # benchmark-specific
-    args = ap.parse_args()
-    cfg = resolve_args(args)
+    ap.add_argument("--limit", type=int, default=None)
+    cfg = resolve_args(ap.parse_args())
+    vr = build_runtime(cfg)
 
-    vr = VirtualRuntime(
-        backend=cfg.backend,
-        model=cfg.model,
-        strategy=cfg.strategy,
-        **cfg.backend_kwargs,
-    )
-    # cfg.think_override  →  None | True | False
+The shared builder applies trace configuration and the optional code-generation
+baseline. Native reasoning settings reach the backend through cfg.backend_kwargs.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-# On networks where something intercepts HTTPS (corporate proxy, antivirus
-# TLS inspection), Python's bundled CA store often doesn't trust the
-# intercepting cert even though the OS does. truststore makes Python's ssl
-# module use the OS certificate store instead — same fix in spirit as
-# git's http.sslBackend=schannel. Must run before any HTTPS call (Groq,
-# Cerebras, HuggingFace datasets, ...), so it's injected here, first.
-try:
-    import truststore
-    truststore.inject_into_ssl()
-except ImportError:
-    pass  # optional — only needed on networks with TLS interception
-
 # Add the src directory to the path so aicomputing is importable when running
 # benchmarks directly (without pip install -e .)
-import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from aicomputing import VirtualRuntime
 from aicomputing.model_config import (
-    ThinkingMode,
-    get_thinking_mode,
     get_provider_preset,
     list_providers,
     PROVIDER_PRESETS,
 )
+from aicomputing.backends.base import BackendCommunicationError, BackendTimeoutError
+from aicomputing.request import ExecuteResult, FailureType
 from aicomputing.strategies import list_strategies
 
 
@@ -65,7 +56,6 @@ class BenchConfig:
     backend: str
     model: str
     strategy: str
-    think_override: Optional[bool]
     backend_kwargs: Dict[str, Any] = field(default_factory=dict)
     trace: Optional[str] = None
     max_tokens: Optional[int] = None
@@ -76,29 +66,36 @@ class BenchConfig:
     baseline: bool = False
 
 
+def configure_system_certificates() -> None:
+    """Configure optional system certificates during application startup."""
+    try:
+        import truststore
+    except ModuleNotFoundError as exc:
+        if exc.name != "truststore":
+            raise
+        return
+    truststore.inject_into_ssl()
+
+
 def add_common_args(ap: argparse.ArgumentParser) -> None:
-    """
-    Add the standard set of backend / model / strategy arguments to a parser.
+    """Register shared benchmark command-line options.
 
-    --provider  Short name for a known cloud provider (groq, cerebras,
-                openrouter, sambanova, ollama). Auto-fills --base-url and
-                sets --backend openai. Overridden by explicit --base-url.
+    --provider       Supply default connection settings from a named preset.
+                     Explicit backend and URL options take precedence.
+    --backend        Backend name; defaults to ollama without a provider.
+    --model          Model identifier, resolved from the preset or fallback.
+    --base-url       API URL, or Ollama host (a trailing /v1 is removed).
+    --api-key        Explicit key; named providers also support environment keys.
+    --strategy       Registered prompting strategy; defaults to direct.
+    --baseline       Run code generation and execution instead of a prompt strategy.
+    --reasoning-effort  OpenAI-compatible native effort string.
+    --ollama-think    Ollama true/false or a model-specific level string.
+    --hf-thinking / --no-hf-thinking  HF chat-template Boolean override.
+    --trace          JSONL trace destination.
+    --max-tokens     Starting output-token budget; truncation retries may grow it.
 
-    --backend   Backend name (ollama, openai). Default: ollama.
-    --model     Model name. Default depends on provider.
-    --base-url  Override the API base URL.
-    --api-key   API key (or set via environment variable).
-    --strategy  direct | cot | hybrid | confidence | consistency.
-                Auto-detected as direct/cot from model if omitted (the
-                other three are never auto-selected — pass them explicitly).
-    --think / --no-think  Override thinking mode. Auto-detected if omitted.
-    --trace     Path to write a JSONL trace file.
-    --max-tokens  Override the starting token budget (default: auto per
-                  strategy/model). Useful for models with a small
-                  tokens-per-minute cap that's below what cot/confidence/
-                  consistency's default 8192-token budget needs — e.g.
-                  Groq's llama-3.1-8b-instant free tier caps at 6000 TPM,
-                  so those strategies 413 there unless capped lower.
+    Native reasoning options are omitted by default and apply independently of
+    the prompting strategy. Options for a different backend are rejected.
     """
     provider_choices = list_providers()
     ap.add_argument(
@@ -107,14 +104,15 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         choices=provider_choices,
         help=(
             f"Known provider shortcut: {', '.join(provider_choices)}. "
-            "Auto-sets --base-url and --backend. "
-            "You still need to supply --api-key and --model."
+            "Supplies defaults for --base-url and --backend. "
+            "Single-model presets can supply the model; "
+            "provider environment variables can supply credentials."
         ),
     )
     ap.add_argument("--backend", default=None,
-                    help="Backend name (ollama, openai). Auto-set by --provider.")
+                    help="Backend name (ollama, openai, hf). Defaults to provider backend or ollama.")
     ap.add_argument("--model", default=None,
-                    help="Model name. Required unless using --provider with a single model.")
+                    help="Model identifier; presets or fallback may supply a default.")
     ap.add_argument("--base-url", default=None,
                     help="API base URL. Auto-set by --provider.")
     ap.add_argument("--api-key", default=None,
@@ -125,54 +123,60 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         choices=list_strategies(),
         help=(
             "Prompting strategy. "
-            "Default: 'cot' for thinking models, 'direct' for non-thinking models."
+            "Default: 'direct', independent of native reasoning settings."
         ),
     )
     ap.add_argument("--trace", default=None,
                     help="Path to write a JSONL trace file.")
-    ap.add_argument("--max-tokens", type=int, default=None, dest="max_tokens",
-                    help="Override the starting token budget (default: auto per strategy/model).")
+    ap.add_argument(
+        "--max-tokens", type=int, default=None, dest="max_tokens",
+        help=(
+            "Starting output-token budget; truncation retries may increase it. "
+            "When omitted, use the run or strategy defaults."
+        ),
+    )
     ap.add_argument(
         "--baseline", action="store_true",
-        # ASCII only: --help is printed with the console's default codepage,
-        # which on Windows is often cp932 and cannot encode an em-dash.
+        # Keep help text compatible with consoles using limited encodings.
         help=(
             "Run the code-generation baseline instead of a spec-only strategy: "
             "generate an implementation, execute it, return the real output. "
-            "NOT AI computing; this is the comparison condition. Overrides "
-            "--strategy. A generation that fails to execute scores as wrong "
-            "(see baselines/code_gen_baseline.py)."
+            "Overrides --strategy. Generated-program failures count as wrong; "
+            "provider and harness failures are excluded from accuracy scoring."
         ),
     )
-    think_group = ap.add_mutually_exclusive_group()
-    think_group.add_argument(
-        "--think", action="store_true", default=None,
-        help="Force thinking mode ON.",
+    ap.add_argument(
+        "--reasoning-effort", default=None,
+        help="OpenAI-compatible reasoning_effort value; omitted by default.",
     )
-    think_group.add_argument(
-        "--no-think", action="store_true", dest="no_think",
-        help="Force thinking mode OFF.",
+    ap.add_argument(
+        "--ollama-think", default=None, metavar="VALUE",
+        help=(
+            "Ollama think value: true, false, or a model-specific level. "
+            "Omitted by default."
+        ),
+    )
+    ap.add_argument(
+        "--hf-thinking", action=argparse.BooleanOptionalAction, default=None,
+        help="HF chat-template enable_thinking override; omitted by default.",
     )
 
 
 def resolve_args(args: argparse.Namespace) -> BenchConfig:
+    """Resolve presets and explicit options into a benchmark configuration.
+
+    Prompting defaults to direct. Native reasoning overrides are passed only
+    to their matching backend, without inferring the model's reasoning mode.
     """
-    Resolve provider presets, auto-detect strategy and think defaults,
-    and return a BenchConfig ready to pass to VirtualRuntime.
-    """
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        raise ValueError("--max-tokens must be positive")
+
     backend = args.backend
     model = args.model
     base_url = args.base_url
     api_key = args.api_key
 
-    # Credentials come from the environment when --api-key is not given.
-    #
-    # This is the other half of "credentials are environment secrets, never
-    # manifest settings": the manifest freezes the provider, and the key for
-    # that provider is looked up by its conventional variable name. Without
-    # this the key had to be threaded through every subprocess invocation as
-    # an argument, and forgetting it produced a full cell of provider_error
-    # rows -- correctly classified as infrastructure, but a wasted run.
+    # Use the provider's environment key when no explicit key was supplied.
     if not api_key and args.provider:
         api_key = os.environ.get(_PROVIDER_ENV_KEYS.get(args.provider.lower(), ""))
 
@@ -200,92 +204,69 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
     if not backend:
         backend = "ollama"
     if not model:
+        if backend != "ollama":
+            raise ValueError(f"--model is required for backend '{backend}'")
         model = "qwen3:4b-instruct"
         print(f"[bench_args] No model specified — using default '{model}'")
 
-    # --- 3. Auto-detect think default from model ---
-    thinking_mode = get_thinking_mode(model)
-
-    if args.think:
-        think_override = True
-    elif args.no_think:
-        think_override = False
-    else:
-        # None: the STRATEGY decides, not the model family.
-        #
-        # This previously derived think=True for any THINKING_TOGGLE or
-        # ALWAYS_THINKS model, and that value reached ExecuteRequest.think,
-        # which strategies treat as an explicit caller override. The effect was
-        # that `direct` -- the minimal execution condition, which requests
-        # think=False -- silently ran WITH reasoning on exactly the models the
-        # experiment targets. Direct vs CoT then compared two thinking
-        # conditions, and the arm that defines the baseline was not the
-        # condition it claimed to be.
-        #
-        # A model family's capability must not choose the experimental
-        # condition. resolve_thinking() decides only whether the backend can
-        # HONOUR what the strategy asked for, and records the answer.
-        think_override = None
-
-    # --- 4. Auto-detect strategy from model and think setting ---
+    # --- 3. Select the prompting strategy independently of native reasoning ---
     strategy = args.strategy
     if getattr(args, "baseline", False):
-        # --baseline replaces the strategy entirely. Reported under the
-        # baseline's own name so the results CSV and the table generators
-        # can tell the comparison condition apart from the spec-only arms.
+        # The baseline generates and executes code; it is a separate condition.
         if strategy is not None:
             print(f"[bench_args] --baseline overrides --strategy {strategy}")
         strategy = BASELINE_NAME
     elif strategy is None:
-        if thinking_mode == ThinkingMode.NO_THINKING or not think_override:
-            strategy = "direct"
-        else:
-            strategy = "cot"
+        strategy = "direct"
 
-    # --- 5. Build backend kwargs ---
+    # Reject connection settings unsupported by the selected adapter.
+    if backend == "hf" and (base_url or api_key):
+        raise ValueError("Backend 'hf' does not accept an API URL or API key")
+    if backend == "ollama" and api_key:
+        raise ValueError("This Ollama adapter does not accept an API key")
+
+    # --- 4. Build backend kwargs ---
     backend_kwargs: Dict[str, Any] = {}
     if base_url:
         if backend == "ollama":
-            # OllamaBackend uses 'host' and the Ollama Python client does not
-            # want the /v1 suffix — strip it if present.
+            # Pass the normalized address even when it points to localhost.
             host = base_url.rstrip("/")
             if host.endswith("/v1"):
                 host = host[:-3]
-            # Only set host if it's not the default (avoids redundant arg)
-            if host not in ("http://localhost:11434", "http://127.0.0.1:11434"):
-                backend_kwargs["host"] = host
+            backend_kwargs["host"] = host
         else:
             backend_kwargs["base_url"] = base_url
     if api_key:
         backend_kwargs["api_key"] = api_key
 
-    # --- 6. For Ollama, verify the model is pulled ---
-    if backend == "ollama":
-        try:
-            import ollama as _ollama
-            pulled = [m.model for m in _ollama.list().models]
-            # Normalise: ollama list may return "qwen3:4b-instruct" or "qwen3:4b-instruct:latest"
-            pulled_base = [m.split(":")[0] + ":" + m.split(":")[1] if m.count(":") >= 1 else m
-                           for m in pulled]
-            model_base = model.split(":latest")[0]
-            if model not in pulled and model_base not in pulled and model not in pulled_base:
-                print(f"[bench_args] WARNING: model '{model}' not found in local Ollama.")
-                print(f"[bench_args] Available models: {pulled}")
-                print(f"[bench_args] Run: ollama pull {model}")
-                print()
-        except Exception:
-            pass  # Ollama not running — will fail at first generate() call with a clearer error
-    thinking_label = {
-        ThinkingMode.ALWAYS_THINKS: "always on (DeepSeek-R1 style)",
-        ThinkingMode.THINKING_TOGGLE: f"{'ON' if think_override else 'OFF'} (toggleable)",
-        ThinkingMode.NO_THINKING: "not supported (instruct model)",
-    }[thinking_mode]
+    # Native controls belong to their backend, independently of strategy.
+    if args.reasoning_effort is not None:
+        if backend != "openai":
+            raise ValueError("--reasoning-effort requires --backend openai")
+        backend_kwargs["reasoning_effort"] = args.reasoning_effort
+
+    if args.ollama_think is not None:
+        if backend != "ollama":
+            raise ValueError("--ollama-think requires --backend ollama")
+        value = args.ollama_think
+        backend_kwargs["think"] = {"true": True, "false": False}.get(value, value)
+
+    if args.hf_thinking is not None:
+        if backend != "hf":
+            raise ValueError("--hf-thinking/--no-hf-thinking requires --backend hf")
+        backend_kwargs["enable_thinking"] = args.hf_thinking
+
+    reasoning_overrides = {
+        key: backend_kwargs[key]
+        for key in ("reasoning_effort", "think", "enable_thinking")
+        if key in backend_kwargs
+    }
 
     print(f"Provider: {args.provider or 'custom'}")
     print(f"Backend:  {backend}")
     print(f"Model:    {model}")
     print(f"Strategy: {strategy}")
-    print(f"Thinking: {thinking_label}")
+    print(f"Reasoning overrides requested: {reasoning_overrides}")
     if base_url:
         print(f"Base URL: {base_url}")
     print()
@@ -294,7 +275,6 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
         backend=backend,
         model=model,
         strategy=strategy,
-        think_override=think_override,
         backend_kwargs=backend_kwargs,
         trace=args.trace,
         max_tokens=args.max_tokens,
@@ -302,9 +282,6 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
     )
 
 
-# Name reported in the `strategy` column when --baseline is used. It is the
-# CodeGenBaseline's own .name, kept in one place so the table generators and
-# the oracles agree on the spelling.
 # Conventional environment variable per provider. Ollama needs none.
 _PROVIDER_ENV_KEYS = {
     "groq": "GROQ_API_KEY",
@@ -313,30 +290,24 @@ _PROVIDER_ENV_KEYS = {
     "sambanova": "SAMBANOVA_API_KEY",
 }
 
+# Strategy name reported for the code-generation baseline.
 BASELINE_NAME = "code_gen_baseline"
 
 
 def build_runtime(cfg: BenchConfig):
+    """Construct a benchmark runtime from resolved configuration.
+
+    The code-generation baseline is imported only when selected and supplied
+    as an instance, keeping it outside the prediction-strategy registry.
+    Starting token budgets are supplied separately on execution requests.
     """
-    Construct the VirtualRuntime for a benchmark run.
-
-    Shared by all four oracles so that --baseline behaves identically in each.
-
-    The baseline is passed as a Strategy *instance* rather than by name.
-    VirtualRuntime accepts either, and this keeps the code-generation path out
-    of the strategy registry entirely: `create_strategy("code_gen_baseline")`
-    still fails, `list_strategies()` still contains only spec-only arms, and
-    the one component that executes model-written code stays reachable solely
-    by an explicit opt-in flag. That matches the standing rule that strategies
-    predict results and never generate or execute code.
-    """
-    from aicomputing import VirtualRuntime
-
     strategy: Any = cfg.strategy
     if cfg.baseline:
-        try:  # running as `python benchmarks/x_oracle.py` (benchmarks/ on path)
+        try:
             from baselines.code_gen_baseline import CodeGenBaseline
-        except ImportError:  # imported as a package, e.g. from tests
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"baselines", "baselines.code_gen_baseline"}:
+                raise
             from benchmarks.baselines.code_gen_baseline import CodeGenBaseline
         strategy = CodeGenBaseline()
 
@@ -350,74 +321,31 @@ def build_runtime(cfg: BenchConfig):
 
 
 def execute_resilient(vr, req, *, label: str = "") -> Any:
+    """Convert invocation failures into excluded benchmark rows, without retrying.
+
+    Explicit backend communication errors are provider failures, and backend
+    timeout errors are timeouts. Other invocation errors are harness failures.
+    KeyboardInterrupt, SystemExit and GeneratorExit propagate.
     """
-    Run one example, converting a failed call into a failed *row*.
-
-    Without this, any exception from vr.execute() propagates out of the
-    per-example loop and aborts the whole benchmark cell, discarding every
-    example already completed in it. That is the wrong trade for a metric
-    that is an average over examples: a single transient provider error
-    costs the entire cell rather than one row of it.
-
-    This was not hypothetical. On the Groq pilot, `bbh x cot` died 312
-    seconds in on a 429 whose own message said "try again in 255ms",
-    throwing away 20 graded examples across four sub-tasks.
-
-    The failure is returned as an ExecuteResult with result=None so that
-    callers need no special case: the value compares unequal to any
-    expected answer and scores incorrect, which is the honest reading of
-    "the model was asked and no answer came back". raw_text carries the
-    exception for the CSV, and exec_status is set to "error" so failed
-    rows can be counted and excluded rather than silently depressing an
-    accuracy figure.
-
-    Note the asymmetry with the retries inside the backend: those retry the
-    *same* call because it may yet succeed. This catches what is left after
-    they are exhausted, and does not retry — a cell that is hitting the rate
-    limit hard should finish and be visibly degraded, not spin.
-    """
-    import time
-
-    from aicomputing.request import ExecuteResult
-
     started = time.perf_counter()
     try:
         return vr.execute(req)
-    except KeyboardInterrupt:
-        raise
-    except BaseException as exc:  # noqa: BLE001 - deliberately total
+    except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         print(f"    [example failed] {label or ''} {detail}".rstrip(), flush=True)
-        # The numeric fields must be real numbers, not None. ExecuteResult
-        # defaults latency_ms and tokens_used to None, and every oracle's CSV
-        # writer formats latency with `:.0f` -- so a None here crashes the
-        # writer at the END of the cell and loses the whole file, which is the
-        # exact failure this function exists to prevent.
-        #
-        # latency is the true elapsed time rather than 0: the retries inside
-        # the backend can spend a minute or more before giving up, and that
-        # cost is real and worth seeing. tokens_used is 0 because no completion
-        # came back. exec_status="error" is what marks the row as a failure;
-        # the numbers are not a claim that anything succeeded.
-        # Classified as INFRASTRUCTURE, not as a model failure. Two things
-        # depend on getting this right:
-        #
-        #   * exec_status is the code-generation baseline's channel, and
-        #     "error" there now means "the generated program raised". Reusing
-        #     it for a 429 would file an API outage as bad generated code.
-        #   * scorable=False keeps the invocation out of the capability
-        #     denominator entirely. A rate limit is not the model answering
-        #     incorrectly, and counting it as one turns a quota problem into a
-        #     capability claim -- on exactly the expensive arms most likely to
-        #     be throttled.
-        from aicomputing.request import FailureType
+        if isinstance(exc, BackendTimeoutError):
+            failure_type = FailureType.TIMEOUT
+        elif isinstance(exc, BackendCommunicationError):
+            failure_type = FailureType.PROVIDER_ERROR
+        else:
+            failure_type = FailureType.HARNESS_ERROR
+
         return ExecuteResult(
             result=None,
             raw_text=f"[execute failed] {detail}",
             model=getattr(vr, "model", ""),
             strategy=getattr(getattr(vr, "strategy", None), "name", ""),
-            failure_type=(FailureType.TIMEOUT if isinstance(exc, TimeoutError)
-                          else FailureType.PROVIDER_ERROR),
+            failure_type=failure_type,
             scorable=False,
             validation_status="unparsed",
             latency_ms=(time.perf_counter() - started) * 1000.0,
@@ -426,29 +354,12 @@ def execute_resilient(vr, req, *, label: str = "") -> Any:
         )
 
 
-# describe_prompt() was removed here.
-#
-# It reconstructed the logged prompt from the strategy NAME, which could not be
-# made faithful:
-#   * it fell through to the direct prompt for any strategy it did not know, so
-#     `pseudocode` logged a prompt it had never sent;
-#   * it returned one string, so `contract` logged only its first of two stages;
-#   * it had no way to see that a validation retry had wrapped the prompt via
-#     build_retry_prompt, so every arm was wrong on a retried example.
-#
-# Each failure was silent and produced plausible-looking text, which is the
-# worst property for a column feeding prompt-level analysis. Strategies now
-# record what they actually sent in StrategyResult.prompts, which reaches the
-# CSV as the `prompts` column and the JSONL trace as "prompts". A strategy
-# added later gets correct logging without touching this module.
-
-
 def print_provider_table() -> None:
-    """Print a table of available providers and their models."""
-    print("Available providers (--provider):")
+    """Print configured provider presets and their example model IDs."""
+    print("Provider presets (--provider):")
     print()
     for name, preset in PROVIDER_PRESETS.items():
         print(f"  {name:<12} {preset['notes']}")
-        for m in preset["models"]:
-            print(f"               • {m}")
+        for model in preset["models"]:
+            print(f"               - {model}")
     print()

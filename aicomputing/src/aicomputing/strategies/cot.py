@@ -1,20 +1,16 @@
-"""
-Structured Chain-of-Thought (SCoT) strategy.
+"""Predict outputs using a structured chain-of-thought prompt.
 
-The model traces Python function execution symbolically — sequential steps,
-branches, loops — maintaining an explicit variable-state log at each step,
-then outputs the final answer as JSON.
+The prompt asks the model to trace execution through sequential steps,
+branches, and loops, track variable state, and return a result object.
+These instructions do not guarantee a correct trace or prediction.
 
-Token budget: this strategy resolves think=True unless the request says
-otherwise, so get_token_budget() returns 8192 for every model, including
-non-thinking instruct ones — the visible SCoT trace needs the room even
-when the model has no hidden reasoning trace. Passing think=False on the
-request drops a non-thinking model to 512; a request-level max_new_tokens
-overrides both.
+Native reasoning is configured by the backend rather than selected by
+this strategy. The structured trace requested by the prompt is separate
+from that configuration.
 
-If the model hits the limit the budget doubles and the call retries, up to
-5 doublings and never above the 32768 cap in strategies/base.py — so from
-8192 the sequence is 8192→16384→32768.
+The initial output-token budget comes from get_token_budget unless
+request.max_new_tokens supplies one. Token-limit retries double the
+budget for up to five additional attempts, without a package-level cap.
 """
 
 from __future__ import annotations
@@ -23,11 +19,16 @@ from typing import Optional
 
 from ..backends.base import Backend
 from ..model_config import get_token_budget
-from ..parsing import parse_result
 from ..prompting import build_cot_prompt, build_retry_prompt
 from ..request import ExecuteRequest
-from .base import (CallStats, Strategy, StrategyResult,
-                   generate_with_retry, make_parser, _is_strict)
+from .base import (
+    CallStats,
+    Strategy,
+    StrategyResult,
+    _is_strict,
+    generate_with_retry,
+    make_parser,
+)
 
 
 class CoTStrategy(Strategy):
@@ -59,9 +60,9 @@ class CoTStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        think = request.think if request.think is not None else True
+        # Preserve the existing default allowance; this does not set native reasoning.
         initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, think,
+            request.model or backend.default_model, extended=True,
         )
 
         def call(max_new_tokens: int):
@@ -71,7 +72,6 @@ class CoTStrategy(Strategy):
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_new_tokens=max_new_tokens,
-                think=think,
             )
 
         psink: dict = {}

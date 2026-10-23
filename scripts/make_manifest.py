@@ -2,15 +2,16 @@
 """
 Build an experiment manifest: the frozen list of items every cell evaluates.
 
-Selection happens once, here, and is written to disk. Runs read the manifest
-rather than re-sampling, which is what makes the experiment reproducible and
-the comparisons paired: every model and every strategy is handed byte-identical
-items, so results join on benchmark_item_id.
+Selection happens once, here, and is written to disk. Runs read the recorded
+item and invocation IDs rather than sampling again. Each cell resolves those
+IDs through the benchmark adapters and verifies the selected content before
+model execution, unless the explicit debug drift override is used. Results
+join on benchmark_item_id; this does not guarantee identical model outputs.
 
 Two configurations ship:
 
-    --preset pilot   small smoke configuration (pilot-v2). Verifies plumbing.
-    --preset main    the primary experiment (requirement 14 sample sizes).
+    --preset pilot   small smoke configuration (pilot-v3). Verifies plumbing.
+    --preset main    the configured primary-experiment sample sizes.
 
 Examples
 --------
@@ -18,9 +19,13 @@ Examples
     python scripts/make_manifest.py --preset main --models a b c d
     python scripts/make_manifest.py --preset main --seed 42 --out manifests/main.json
 
-Rebuilding with the same seed and the same dataset revisions reproduces the
-same manifest. If a dataset revision has changed, the run reports a pool
-fingerprint mismatch rather than silently evaluating different problems.
+Matching seeds, ID pools, invocation ordering and selection rules reproduce
+the selection. A rebuilt manifest can still differ, including its timestamp.
+Dataset metadata describes available source information; it is not proof of
+identical resolved content. ID-pool checks detect changes to the ID collection;
+selected-content verification detects missing fingerprints, incomplete item
+coverage and changes to recorded specifications, inputs or expected outputs.
+Default construction fails if selected content cannot be fully fingerprinted.
 """
 
 from __future__ import annotations
@@ -37,11 +42,11 @@ for path in (os.path.join(_PKG, "benchmarks"), os.path.join(_PKG, "src")):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-try:  # HTTPS interception (corporate proxy / AV) — same fix as bench_args
-    import truststore
-    truststore.inject_into_ssl()
-except Exception:  # pragma: no cover
-    pass
+from bench_args import configure_system_certificates  # noqa: E402
+
+# Configure application HTTPS before importing dataset/client modules.
+if __name__ == "__main__":
+    configure_system_certificates()
 
 from experiment import (  # noqa: E402
     ALL_BENCHMARKS,
@@ -50,19 +55,22 @@ from experiment import (  # noqa: E402
     PILOT_SIZES,
     build_manifest,
     save_manifest,
+    resolve_model_connection,
+    resolve_reasoning_settings,
+    resolve_generation_settings,
 )
 from aicomputing.strategies import list_arms  # noqa: E402
 
 PRESETS = {
     "pilot": {
-        "experiment_id": "pilot-v2",
+        "experiment_id": "pilot-v3",
         "sizes": PILOT_SIZES,
-        "default_out": "manifests/pilot-v2.json",
+        "default_out": "manifests/pilot-v3.json",
     },
     "main": {
-        "experiment_id": "main-v1",
+        "experiment_id": "main-v2",
         "sizes": MAIN_SIZES,
-        "default_out": "manifests/main-v1.json",
+        "default_out": "manifests/main-v2.json",
     },
 }
 
@@ -73,8 +81,8 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="Output path (default: per preset)")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--model-configs", default=None, metavar="JSON",
-                    help="Path to a JSON file of {model_id: {provider, "
-                         "max_new_tokens, ...}}. Supplying it FREEZES the run "
+                    help="Path to JSON model entries with provider or backend, "
+                         "optional base_url/reasoning/generation settings. Supplying it FREEZES the run "
                          "configuration: `models` is derived from its keys and "
                          "`model_configs` is stored in the manifest. Required "
                          "for a reported run; never put API keys in it.")
@@ -101,19 +109,12 @@ def main() -> int:
             ap.error(f"{args.model_configs} must be a non-empty JSON object "
                      f"keyed by model ID")
         for model_id, cfg in model_configs.items():
-            if not isinstance(cfg, dict):
-                ap.error(f"model_configs[{model_id!r}] must be an object")
-            if not cfg.get("provider"):
-                ap.error(f"model_configs[{model_id!r}] has no 'provider'. The "
-                         f"provider is part of the experimental condition and "
-                         f"must be frozen with the model, not passed at run "
-                         f"time.")
-            # Credentials are secrets and belong in the environment. A manifest
-            # is committed and shared; a key in one is a leak, not a setting.
-            for banned in ("api_key", "apiKey", "token", "secret"):
-                if banned in cfg:
-                    ap.error(f"model_configs[{model_id!r}] contains {banned!r}. "
-                             f"Credentials must never be stored in a manifest.")
+            try:
+                connection = resolve_model_connection(cfg)
+                resolve_reasoning_settings(connection["backend"], cfg.get("reasoning", {}))
+                resolve_generation_settings({}, cfg)
+            except (TypeError, ValueError) as exc:
+                ap.error(f"model_configs[{model_id!r}]: {exc}")
         if args.models and sorted(args.models) != sorted(model_configs):
             ap.error("--models disagrees with the keys in --model-configs; "
                      "supply one or the other")
@@ -156,8 +157,8 @@ def main() -> int:
     if manifest["model_configs"]:
         print("models     : FROZEN")
         for model_id, cfg in sorted(manifest["model_configs"].items()):
-            caps = ", ".join(f"{k}={v}" for k, v in sorted(cfg.items()))
-            print(f"   {model_id}: {caps}")
+            settings = ", ".join(f"{k}={v}" for k, v in sorted(cfg.items()))
+            print(f"   {model_id}: {settings}")
     else:
         print("models     : TEMPLATE (models: [], model_configs: {}) -- this is "
               "a selection template, not a run manifest. Rebuild with "

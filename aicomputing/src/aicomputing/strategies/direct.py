@@ -1,20 +1,11 @@
-"""
-Direct prediction strategy.
+"""Predict function outputs directly from their specifications and inputs.
 
-The model receives the signature, docstring, and inputs, and directly
-predicts the output as a JSON result without any reasoning trace.
+The strategy requests a result object. Native reasoning is configured by
+the backend rather than selected by this strategy.
 
-Token budget: this strategy resolves think=False unless the request says
-otherwise, so get_token_budget() returns 512 for most models — the answer
-is a short JSON object. Models classified ALWAYS_THINKS (DeepSeek-R1 and
-friends) get 8192 even here, because their reasoning trace cannot be
-disabled and would otherwise consume the whole budget. A request-level
-max_new_tokens overrides both.
-
-If the model hits the limit the budget doubles and the call retries, up to
-5 doublings and never above the 32768 cap in strategies/base.py — so from
-512 the sequence tops out at 16384, while a request that starts at 8192
-reaches the cap after two doublings.
+The initial output-token budget comes from get_token_budget unless
+request.max_new_tokens supplies one. Token-limit retries double the
+budget for up to five additional attempts, without a package-level cap.
 """
 
 from __future__ import annotations
@@ -23,15 +14,20 @@ from typing import Optional
 
 from ..backends.base import Backend
 from ..model_config import get_token_budget
-from ..parsing import parse_result
 from ..prompting import build_direct_prompt, build_retry_prompt
 from ..request import ExecuteRequest
-from .base import (CallStats, Strategy, StrategyResult,
-                   generate_with_retry, make_parser, _is_strict)
+from .base import (
+    CallStats,
+    Strategy,
+    StrategyResult,
+    _is_strict,
+    generate_with_retry,
+    make_parser,
+)
 
 
 class DirectStrategy(Strategy):
-    """Predict the output directly from the spec, no reasoning trace."""
+    """Predict an output using the direct prompt, without a separate check stage."""
 
     def __init__(self, include_fewshot: bool = True) -> None:
         self._include_fewshot = include_fewshot
@@ -59,9 +55,9 @@ class DirectStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        think = request.think if request.think is not None else False
+        # Preserve the existing default allowance; this does not set native reasoning.
         initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, think,
+            request.model or backend.default_model, extended=False,
         )
 
         def call(max_new_tokens: int):
@@ -71,7 +67,6 @@ class DirectStrategy(Strategy):
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_new_tokens=max_new_tokens,
-                think=think,
             )
 
         psink: dict = {}

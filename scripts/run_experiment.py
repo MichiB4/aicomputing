@@ -2,13 +2,13 @@
 """
 Run every cell of an experiment manifest.
 
-A cell is one (model x benchmark x strategy). The manifest fixes which items
-each cell evaluates, so all cells are directly comparable and the results join
-on benchmark_item_id.
+A cell is one (model x benchmark x strategy). The manifest records item and
+invocation selections for comparisons within each benchmark. Results join on
+benchmark_item_id. Reusing a selection does not guarantee equal model outputs.
 
-    pilot-v2       python scripts/run_experiment.py --manifest manifests/pilot-v2.json \\
+    pilot-v3       python scripts/run_experiment.py --manifest manifests/pilot-v3.json \\
                        --provider groq --model qwen/qwen3.8-27b
-    main run       python scripts/run_experiment.py --manifest manifests/main-v1.json \\
+    main run       python scripts/run_experiment.py --manifest manifests/main-v2.json \\
                        --provider groq --model <id>
 
 Cells run in separate processes, one per cell, for the same reason the earlier
@@ -19,14 +19,16 @@ The code-generation baseline is scheduled only on the benchmarks the manifest
 lists for it (HumanEval+ and MBPP+); it is never run on GSM8K or BBH.
 
 This script does NOT decide sample sizes, seeds, or item selection. Those live
-in the manifest, built by scripts/make_manifest.py. Running the same manifest
-twice evaluates the same items.
+in the manifest, built by scripts/make_manifest.py. Each cell resolves the
+recorded IDs and verifies selected content before model execution. Incomplete
+coverage, missing fingerprints or changed content reject the cell. The direct
+benchmark runner has an explicit debug drift override; this orchestrator does
+not expose it.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -40,25 +42,12 @@ for path in (_BENCH, os.path.join(_PKG, "src")):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from experiment import BASELINE_NAME, load_manifest  # noqa: E402
+from experiment import (  # noqa: E402
+    BASELINE_NAME, load_manifest, resolve_model_connection, resolve_reasoning_settings,
+    resolve_generation_settings,
+)
 
 RUN_BENCHMARK = os.path.join(_BENCH, "run_benchmark.py")
-
-# Per-request token caps keyed by MODEL, because the constraint belongs to the
-# model. Only add an entry where a cap was actually observed: an unnecessary
-# one truncates the structured arms and corrupts what the experiment measures.
-# DEPRECATED as an experiment input. The manifest's `model_configs` block is
-# authoritative; this remains only as a convenience default for ad-hoc runs
-# against a manifest that has no entry for the model, and the runner prints a
-# warning when it is used so the gap is visible rather than silent.
-MODEL_MAX_TOKENS = {
-    # Groq free tier counts PROMPT + REQUESTED max_tokens against an 8000 TPM
-    # bucket for both of these, so a high cap 429s on every call that follows
-    # another within the minute. Verified 2026-08-29.
-    "openai/gpt-oss-120b": 4096,
-    "qwen/qwen3.8-27b": 4096,
-}
-
 
 def cells(manifest, models, strategies=None, benchmarks=None, with_baseline=True):
     """Enumerate (model, benchmark, strategy, is_baseline) in a stable order."""
@@ -81,6 +70,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Run an experiment manifest")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--provider", default=None)
+    ap.add_argument("--backend", default=None)
+    ap.add_argument("--base-url", default=None)
     ap.add_argument("--model", action="append", default=[],
                     help="Repeatable. Defaults to the models named in the manifest.")
     ap.add_argument("--api-key", default=None)
@@ -95,11 +86,13 @@ def main() -> int:
                     help="List the cells and exit without calling any model.")
     ap.add_argument("--allow-unfrozen-model-config", action="store_true",
                     help="Run a model that has no complete model_configs entry "
-                         "in the manifest. DEBUG ONLY: provider and token cap "
-                         "then come from the CLI and a runner-side table, so "
+                         "in the manifest. DEBUG ONLY: connection settings come from "
+                         "the CLI; generation uses manifest/strategy defaults, so "
                          "the run is not manifest-reproducible and must not be "
                          "reported.")
     args = ap.parse_args()
+    if args.limit is not None and args.limit < 0:
+        ap.error("--limit must be non-negative")
 
     manifest = load_manifest(args.manifest)
     experiment_id = manifest.get("experiment_id", "experiment")
@@ -107,56 +100,53 @@ def main() -> int:
     if not models:
         ap.error("no models: pass --model, or record models in the manifest")
 
-    # --- model configuration must be frozen for a reported run -------------
-    #
-    # provider + model ID + any required token cap are part of the
-    # experimental condition. Previously a manifest without model_configs ran
-    # anyway, taking the provider from the CLI and the cap from a runner-side
-    # table -- so two runs of the same manifest could differ in ways the
-    # manifest did not record, which is exactly what it exists to prevent.
-    model_configs = manifest.get("model_configs") or {}
-    unfrozen = [m for m in models
-                if not (model_configs.get(m) or {}).get("provider")]
+    # Validate all selected models before scheduling any cell.
+    model_configs = manifest.get("model_configs", {})
+    if not isinstance(model_configs, dict):
+        ap.error("model_configs must be an object keyed by model ID")
+    unfrozen = [model for model in models if model not in model_configs]
     if unfrozen and not args.allow_unfrozen_model_config:
-        ap.error(
-            "no frozen model_configs entry for: " + ", ".join(unfrozen)
-            + ".\n"
-            "A reported run must take provider and token limits from the "
-            "manifest. Build a finalised manifest first:\n"
-            "    python scripts/make_manifest.py --preset "
-            + ("pilot" if experiment_id.startswith("pilot") else "main")
-            + " --model-configs <config.json>\n"
-            "or pass --allow-unfrozen-model-config for a debugging run that "
-            "is explicitly NOT reproducible."
-        )
-    if unfrozen:
-        print("!" * 68)
-        print("WARNING: running UNFROZEN models: " + ", ".join(unfrozen))
-        print("Provider and token caps come from the CLI and runner defaults,")
-        print("not from the manifest. This run is NOT manifest-reproducible")
-        print("and must not be reported as pilot-v2 or main-v1 output.")
-        print("!" * 68)
-
-    # --- provider comes from the manifest for frozen models ----------------
-    #
-    # A CLI provider that disagrees with the frozen one would silently change
-    # the experimental condition while the manifest kept describing the old
-    # one, so a mismatch is refused rather than resolved.
+        ap.error("no frozen model configuration for: " + ", ".join(unfrozen))
+    try:
+        generation = resolve_generation_settings(manifest.get("generation", {}))
+    except (TypeError, ValueError) as exc:
+        ap.error(f"generation: {exc}")
     for model in models:
-        frozen_provider = (model_configs.get(model) or {}).get("provider")
-        if frozen_provider and args.provider and args.provider != frozen_provider:
-            ap.error(
-                f"--provider {args.provider!r} contradicts the manifest, which "
-                f"freezes {model!r} to provider {frozen_provider!r}. Drop "
-                f"--provider (it is unnecessary for a frozen run), or rebuild "
-                f"the manifest if the provider genuinely changed."
-            )
+        if model in model_configs:
+            config = model_configs[model]
+            try:
+                connection = resolve_model_connection(config)
+                resolve_reasoning_settings(connection["backend"], config.get("reasoning", {}))
+                resolve_generation_settings(generation, config)
+            except (TypeError, ValueError) as exc:
+                ap.error(f"model_configs[{model!r}]: {exc}")
+            for field, value in connection.items():
+                supplied = getattr(args, field)
+                if supplied is not None and supplied != value:
+                    ap.error(f"CLI {field} conflicts with the manifest for {model!r}")
+            if args.api_key and connection["backend"] != "openai":
+                ap.error("--api-key is supported only for the OpenAI-compatible adapter")
+    if unfrozen:
+        print("WARNING: unfrozen models: " + ", ".join(unfrozen))
+        print("This debug run is not manifest-reproducible and must not be reported.")
 
-    out_dir = args.out_dir or os.path.join(_ROOT, "aicomputing", "results", experiment_id)
-    os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.abspath(
+        args.out_dir or os.path.join(_ROOT, "aicomputing", "results", experiment_id))
 
     plan = cells(manifest, models, args.strategies, args.benchmarks,
                  with_baseline=not args.no_baseline)
+    output_paths, seen_outputs = [], {}
+    for cell in plan:
+        model, bench, strategy, _ = cell
+        safe_model = "".join(c if c.isalnum() or c in "-._" else "-" for c in model)
+        out_csv = os.path.join(out_dir, f"{safe_model}__{bench}__{strategy}.csv")
+        path_key = os.path.normcase(os.path.abspath(out_csv))
+        if path_key in seen_outputs:
+            ap.error(f"result path collision: {seen_outputs[path_key]!r} "
+                     f"and {cell!r} -> {out_csv}")
+        seen_outputs[path_key] = cell
+        output_paths.append(out_csv)
+    os.makedirs(out_dir, exist_ok=True)
 
     n_items = sum(e["selected"] for e in manifest["benchmarks"].values())
     print(f"Experiment '{experiment_id}'  seed={manifest['seed']}  "
@@ -174,12 +164,10 @@ def main() -> int:
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     failed, started = [], time.time()
 
-    for i, (model, bench, strategy, is_baseline) in enumerate(plan, 1):
+    for i, (cell, out_csv) in enumerate(zip(plan, output_paths), 1):
+        model, bench, strategy, is_baseline = cell
         tag = " [baseline]" if is_baseline else ""
         print(f"[{i}/{len(plan)}] {model}  {bench} x {strategy}{tag} " + "-" * 20, flush=True)
-
-        safe_model = "".join(c if c.isalnum() or c in "-._" else "-" for c in model)
-        out_csv = os.path.join(out_dir, f"{safe_model}__{bench}__{strategy}.csv")
 
         cmd = [sys.executable, RUN_BENCHMARK,
                "--benchmark", bench, "--manifest", os.path.abspath(args.manifest),
@@ -188,29 +176,17 @@ def main() -> int:
             cmd.append("--baseline")
         else:
             cmd += ["--strategy", strategy]
-        # Frozen provider wins; --provider is only a fallback for the
-        # explicitly unfrozen debug path (and is validated to agree above).
-        provider = (model_configs.get(model) or {}).get("provider") or args.provider
-        if provider:
-            cmd += ["--provider", provider]
+        # Frozen connection/native settings are read directly by the child.
+        if model in unfrozen:
+            cmd.append("--allow-unfrozen-model-config")
+            for flag, value in (("--provider", args.provider), ("--backend", args.backend),
+                                ("--base-url", args.base_url)):
+                if value is not None:
+                    cmd += [flag, value]
         if args.api_key:
             cmd += ["--api-key", args.api_key]
-        if args.limit:
+        if args.limit is not None:
             cmd += ["--limit", str(args.limit)]
-        # Only used when the manifest does not configure this model. A cap
-        # applied from here does not appear in the manifest, so the run is not
-        # fully manifest-reproducible and says so.
-        # A frozen model's cap comes from the manifest, which run_benchmark
-        # reads directly, so nothing is passed here. MODEL_MAX_TOKENS is only
-        # consulted on the explicitly unfrozen debug path.
-        if model not in model_configs:
-            cap = MODEL_MAX_TOKENS.get(model)
-            if cap:
-                print(f"    NOTE: {model} is unfrozen; applying the runner "
-                      f"default max_tokens={cap}. Not manifest-reproducible.",
-                      flush=True)
-                cmd += ["--max-tokens", str(cap)]
-
         t0 = time.time()
         proc = subprocess.run(cmd, env=env, cwd=_BENCH)
         elapsed = time.time() - t0

@@ -17,16 +17,17 @@ Usage:
 
 NOTE (revised experimental design)
 ----------------------------------
-This script is no longer the experiment entry point. It samples with
-`--limit N`, unseeded and without a manifest, so different runs and different
-models can see different items -- which breaks the paired analysis.
+This script is no longer the experiment entry point. `--limit N` takes the
+first N tasks in problem-file order. Paired comparisons require matching
+problem files, task ordering and limits; this entry point records no manifest.
 
-It is retained because it holds this benchmark's grader (imported by
-benchmarks/adapters.py) and because it reproduces the historical pilot results.
+It retains this benchmark's grader (imported by benchmarks/adapters.py) and
+an ad-hoc entry point. Historical pilot reproduction requires the matching
+code revision and manifest.
 
 For the experiment use:
-    python scripts/run_experiment.py --manifest manifests/main-v1.json ...
-See CHANGES_EXPERIMENT.md.
+    python scripts/run_experiment.py --manifest manifests/main-v2.json ...
+See aicomputing/README.md for manifest configuration and execution.
 """
 
 from __future__ import annotations
@@ -34,14 +35,22 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import doctest
 import json
+import math
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from bench_args import (  # adjusts sys.path first
     add_common_args, resolve_args, build_runtime, execute_resilient,
+    configure_system_certificates,
 )
+
+# Configure application HTTPS before importing clients; grader imports stay inert.
+if __name__ == "__main__":
+    configure_system_certificates()
+
 from aicomputing import VirtualRuntime, ExecuteRequest
 
 # Imported lazily rather than at module scope: a missing optional dependency
@@ -108,16 +117,12 @@ def _extract_signature(prompt: str) -> str:
 
 
 def _extract_param_names(signature: str) -> List[str]:
-    m = re.match(r"\w+\(([^)]*)\)", signature)
-    if not m:
+    """Read positional names without evaluating annotations or defaults."""
+    try:
+        args = ast.parse(f"def {signature}:\n    pass").body[0].args
+    except SyntaxError:
         return []
-    params = []
-    for part in m.group(1).split(","):
-        part = part.strip()
-        if part:
-            name = part.split(":")[0].split("=")[0].strip()
-            params.append(name)
-    return params
+    return [arg.arg for arg in (*args.posonlyargs, *args.args)]
 
 
 def _split_docstring(prompt: str) -> Tuple[List[str], List[Tuple[str, str]]]:
@@ -151,32 +156,20 @@ def _split_docstring(prompt: str) -> Tuple[List[str], List[Tuple[str, str]]]:
         elif in_doc:
             raw_doc.append(stripped)
 
-    # Split into description (before >>>) and examples
-    doc_lines = []
-    example_blocks = []
-    i = 0
-    while i < len(raw_doc):
-        line = raw_doc[i]
-        if line.startswith(">>>"):
-            # This is a call line; next line is the expected result
-            call_line = line[3:].strip()  # strip ">>> "
-            result_line = ""
-            if i + 1 < len(raw_doc) and not raw_doc[i + 1].startswith(">>>"):
-                result_line = raw_doc[i + 1].strip()
-                i += 2
-            else:
-                i += 1
-            example_blocks.append((call_line, result_line))
-        else:
-            doc_lines.append(line)
-            i += 1
-
+    # Preserve complete doctest blocks while keeping only preceding prose.
+    parts = doctest.DocTestParser().parse("\n".join(raw_doc))
+    doc_lines = parts[0].splitlines()
+    example_blocks = [
+        (part.source.strip(), part.want.rstrip("\n"))
+        for part in parts
+        if isinstance(part, doctest.Example)
+    ]
     return doc_lines, example_blocks
 
 
 def _parse_call_inputs(call_line: str, func_name: str, param_names: List[str]) -> Dict[str, Any]:
     """
-    Parse "func_name(arg1, arg2)" into {"param1": arg1, "param2": arg2}.
+    Parse literal positional and named arguments, retaining raw fallbacks.
     """
     # Extract the arguments portion: everything inside the outermost parens
     m = re.match(rf"{re.escape(func_name)}\s*\((.*)\)\s*$", call_line, re.DOTALL)
@@ -187,16 +180,22 @@ def _parse_call_inputs(call_line: str, func_name: str, param_names: List[str]) -
     if not args_str:
         return {}
 
-    # Parse arguments using ast
+    # Parse literal positional and named arguments.
+    keywords = {}
     try:
         # Wrap in a function call to parse: f(arg1, arg2)
         tree = ast.parse(f"f({args_str})", mode="eval")
         call_node = tree.body
         if isinstance(call_node, ast.Call):
             args = [ast.literal_eval(a) for a in call_node.args]
+            for keyword in call_node.keywords:
+                if keyword.arg is None or keyword.arg in keywords:
+                    return {"input": args_str}
+                keywords[keyword.arg] = ast.literal_eval(keyword.value)
         else:
             args = [ast.literal_eval(tree.body)]
     except (ValueError, SyntaxError):
+        keywords = {}
         # Fallback: try literal_eval on the whole thing
         try:
             val = ast.literal_eval(args_str)
@@ -210,6 +209,9 @@ def _parse_call_inputs(call_line: str, func_name: str, param_names: List[str]) -
             inputs[param_names[i]] = val
         else:
             inputs[f"arg{i}"] = val
+    if inputs.keys() & keywords.keys():
+        return {"input": args_str}
+    inputs.update(keywords)
     return inputs
 
 
@@ -223,32 +225,73 @@ def _parse_expected(result_line: str) -> Any:
         return result_line
 
 
-def results_match(predicted: Any, expected: Any, tolerance: float = 1e-6) -> bool:
-    """Compare predicted vs expected with type-aware matching."""
-    if predicted is None and expected is not None:
+def _unordered_results_match(predicted: List[Any], expected: List[Any], tolerance: float) -> bool:
+    """Find a one-to-one match without depending on container iteration order."""
+    if len(predicted) != len(expected):
+        return False
+    candidates = [
+        [index for index, value in enumerate(expected)
+         if results_match(item, value, tolerance)]
+        for item in predicted
+    ]
+    matches: List[Optional[int]] = [None] * len(expected)
+
+    def assign(item_index: int, visited: set) -> bool:
+        for index in candidates[item_index]:
+            if index in visited:
+                continue
+            visited.add(index)
+            previous = matches[index]
+            if previous is None or assign(previous, visited):
+                matches[index] = item_index
+                return True
         return False
 
-    # Exact match
-    if predicted == expected:
-        return True
+    return all(assign(index, set()) for index in range(len(predicted)))
 
-    # Numeric tolerance
-    try:
-        if isinstance(expected, (int, float)) and isinstance(predicted, (int, float)):
-            return abs(float(predicted) - float(expected)) < tolerance
-    except (ValueError, TypeError):
-        pass
 
-    # List/tuple: compare element-wise
-    if isinstance(expected, (list, tuple)) and isinstance(predicted, (list, tuple)):
-        if len(expected) != len(predicted):
+def results_match(predicted: Any, expected: Any, tolerance: float = 1e-6) -> bool:
+    """Compare values recursively, without stringification or boolean coercion.
+
+    Integers and floats may match numerically using the absolute tolerance;
+    list/tuple sequences may match across those two container types. Dictionary
+    entries and set/frozenset members match one-to-one without regard to order.
+    Strings retain case and whitespace. Nonfinite floats never match.
+    Other value types require matching types and their normal equality.
+    """
+    if predicted is None or expected is None:
+        return predicted is expected
+    if isinstance(predicted, bool) or isinstance(expected, bool):
+        return isinstance(predicted, bool) and isinstance(expected, bool) and predicted == expected
+    if isinstance(predicted, (int, float)) or isinstance(expected, (int, float)):
+        if not isinstance(predicted, (int, float)) or not isinstance(expected, (int, float)):
             return False
-        return all(results_match(p, e, tolerance) for p, e in zip(predicted, expected))
-
-    # String comparison (case-insensitive for booleans)
-    pred_str = str(predicted).strip().lower()
-    exp_str = str(expected).strip().lower()
-    return pred_str == exp_str
+        if any(isinstance(value, float) and not math.isfinite(value)
+               for value in (predicted, expected)):
+            return False
+        if predicted == expected:
+            return True
+        try:
+            return abs(predicted - expected) < tolerance
+        except OverflowError:
+            return False
+    if isinstance(predicted, (list, tuple)) or isinstance(expected, (list, tuple)):
+        return (
+            isinstance(predicted, (list, tuple)) and isinstance(expected, (list, tuple))
+            and len(predicted) == len(expected)
+            and all(results_match(left, right, tolerance) for left, right in zip(predicted, expected))
+        )
+    if isinstance(predicted, dict) or isinstance(expected, dict):
+        return (
+            isinstance(predicted, dict) and isinstance(expected, dict)
+            and _unordered_results_match(list(predicted.items()), list(expected.items()), tolerance)
+        )
+    if isinstance(predicted, (set, frozenset)) or isinstance(expected, (set, frozenset)):
+        return (
+            isinstance(predicted, (set, frozenset)) and isinstance(expected, (set, frozenset))
+            and _unordered_results_match(list(predicted), list(expected), tolerance)
+        )
+    return type(predicted) is type(expected) and bool(predicted == expected)
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +305,9 @@ def main():
     ap.add_argument("--problem-file", default=None)
     ap.add_argument("--out-csv", default=None)
     args = ap.parse_args()
+    if args.limit is not None and args.limit < 0:
+        ap.error("--limit must be non-negative")
     cfg = resolve_args(args)
-
-    think_override = cfg.think_override
 
     if args.problem_file:
         problems = read_problems(args.problem_file)
@@ -272,7 +315,7 @@ def main():
         from human_eval.data import HUMAN_EVAL   # lazy: see read_problems above
         problems = read_problems(HUMAN_EVAL)
     task_ids = list(problems.keys())
-    if args.limit:
+    if args.limit is not None:
         task_ids = task_ids[:args.limit]
 
     vr = build_runtime(cfg)
@@ -283,6 +326,12 @@ def main():
 
     all_results = []
     task_pass_count = 0
+
+    def _json(value):
+        try:
+            return json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            return json.dumps(str(value))
 
     for tid in tqdm(task_ids, desc="Tasks"):
         task = problems[tid]
@@ -300,6 +349,7 @@ def main():
                 "exec_status": "", "pre_revision_correct": "",
                 "revised": None, "pre_revision_value": "null",
                 "prompts": "[]",
+                "reasoning_requests": "[]",
             })
             continue
 
@@ -311,12 +361,15 @@ def main():
                 docstring=docstring,
                 inputs=ex["inputs"],
                 strategy=cfg.strategy,
-                think=think_override,
                 strict_types=False,
                 max_new_tokens=cfg.max_tokens,
             ), label=f"{tid}#{i}")
 
-            correct = results_match(r.result, ex["expected"])
+            correct = (
+                r.exec_status in (None, "ok")
+                and r.validation_status != "unparsed"
+                and results_match(r.result, ex["expected"])
+            )
             pre_rev_correct = (
                 "" if r.revised is None
                 else results_match(r.pre_revision_value, ex["expected"])
@@ -343,9 +396,10 @@ def main():
                 "exec_status": r.exec_status or "",
                 "pre_revision_correct": pre_rev_correct,
                 "revised": r.revised,
-                "pre_revision_value": json.dumps(r.pre_revision_value, default=str),
+                "pre_revision_value": _json(r.pre_revision_value),
                 "tokens_used": r.tokens_used,
                 "prompts": json.dumps(r.prompts, default=str),
+                "reasoning_requests": json.dumps(r.reasoning_requests, default=str),
             })
 
         if task_ok:
@@ -355,10 +409,12 @@ def main():
     total_tasks = len(task_ids)
     total_examples = len(all_results)
     correct_examples = sum(1 for r in all_results if r["correct"])
+    task_accuracy = task_pass_count / total_tasks if total_tasks else 0.0
+    example_accuracy = correct_examples / total_examples if total_examples else 0.0
 
     print(f"\n{'='*50}")
-    print(f"Tasks passed:    {task_pass_count}/{total_tasks} ({task_pass_count/total_tasks:.4f})")
-    print(f"Examples correct: {correct_examples}/{total_examples} ({correct_examples/total_examples:.4f})")
+    print(f"Tasks passed:    {task_pass_count}/{total_tasks} ({task_accuracy:.4f})")
+    print(f"Examples correct: {correct_examples}/{total_examples} ({example_accuracy:.4f})")
     print()
 
     # Print details
@@ -390,19 +446,21 @@ def main():
                 "latency_ms", "tokens_used", "token_retries",
                 "benchmark", "type_warnings", "exec_status",
                 "pre_revision_correct", "revised", "pre_revision_value",
+                "reasoning_requests",
             ])
             for r in all_results:
                 w.writerow([
                     r["task_id"], r["example_idx"], r["correct"],
                     r["signature"], r["docstring"],
-                    r["input_line"], json.dumps(r["inputs"], default=str),
-                    r["expected_line"], json.dumps(r["expected"], default=str),
-                    r["raw_text"], json.dumps(r["parsed_result"], default=str),
+                    r["input_line"], _json(r["inputs"]),
+                    r["expected_line"], _json(r["expected"]),
+                    r["raw_text"], _json(r["parsed_result"]),
                     r["prompts"],
                     cfg.model, cfg.strategy,
                     f"{r['latency_ms']:.0f}", r["tokens_used"], r["token_retries"],
                     r["benchmark"], r["type_warnings"], r["exec_status"],
                     r["pre_revision_correct"], r["revised"], r["pre_revision_value"],
+                    r["reasoning_requests"],
                 ])
         print(f"\nResults written to {args.out_csv}")
 

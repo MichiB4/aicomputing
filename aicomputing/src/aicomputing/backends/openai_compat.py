@@ -1,52 +1,35 @@
-"""
-OpenAI-compatible API backend for AI Computing.
+"""OpenAI-compatible chat-completions backend for AI Computing.
 
-Works with any server that exposes the OpenAI chat completions API:
-Groq, Cerebras, OpenRouter, SambaNova, vLLM, LM Studio, etc.
+Uses the optional OpenAI client with a configurable endpoint and model.
+Compatibility depends on the server's implementation of the API.
 
-Thinking behaviour
-------------------
-Different model families handle the `think` flag differently:
+Native reasoning uses an optional backend-level reasoning_effort setting.
+When configured, its literal value is sent to the provider; otherwise the
+parameter is omitted. Support and interpretation depend on the endpoint
+and model. A successful request does not prove the setting was honored.
+No model-name-based controls or prompt directives are added.
 
-  ALWAYS_THINKS (DeepSeek-R1)
-    The model always reasons. `think=False` is logged as a warning but
-    the request is sent unchanged — the thinking trace will be stripped
-    from the visible output by _strip_thinking().
-
-  THINKING_TOGGLE (Qwen3, GPT-OSS-120B)
-    When `think=False`, the string ``/no_think`` is appended to the last
-    user message. This is the same convention used by the Ollama backend
-    and matches Groq/Cerebras's documented Qwen3 toggle mechanism.
-
-  NO_THINKING (Llama, Phi, Mistral, etc.)
-    The `think` parameter has no effect — these models don't generate
-    reasoning traces regardless.
+Response text passes through strip_thinking() before being returned.
 
 Install: pip install aicomputing[openai]
 """
 
 from __future__ import annotations
 
-import logging
+import os
 from typing import Any, Dict, List, Optional
 
-from ..model_config import (
-    DEFAULT_MAX_NEW_TOKENS,
-    DEFAULT_THINK,
-    ThinkingMode,
-    get_thinking_mode,
-    resolve_thinking,
-)
-from ._text_utils import append_no_think, strip_thinking
+from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from ._text_utils import strip_thinking
 from .base import (
     Backend,
+    BackendCommunicationError,
+    BackendTimeoutError,
     GenerateResponse,
     ToolUseDetected,
     detect_tool_use,
     normalize_finish_reason,
 )
-
-logger = logging.getLogger("aicomputing")
 
 
 class OpenAICompatBackend(Backend):
@@ -58,32 +41,49 @@ class OpenAICompatBackend(Backend):
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         allow_tool_use: bool = False,
+        *,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
+        if reasoning_effort is not None:
+            if not isinstance(reasoning_effort, str):
+                raise TypeError("reasoning_effort must be a string or None")
+            if not reasoning_effort.strip():
+                raise ValueError("reasoning_effort must not be empty")
+
+        self._reasoning_effort = reasoning_effort
         self._model_name = model
         self._base_url = base_url
         self._api_key = api_key
         self._client = None
-        # Server-side tool use invalidates spec-only execution reasoning: an
-        # interpreter, not the model, would have produced the value. Requests
-        # never declare tools, so this only fires on a provider-side default.
-        # Leave it False for anything whose numbers reach the thesis.
+        # When True, skip rejection of responses with tool-use indicators.
+        # This flag does not execute tools or enable them in requests.
         self._allow_tool_use = allow_tool_use
 
-    # Retries for transient HTTP failures, chiefly 429. The SDK default is 2
-    # with a sub-second backoff, which is tuned for a request-rate limit and
-    # is too short for a TOKEN-rate one: a free-tier tokens-per-minute bucket
-    # can need most of a minute to refill, and the reasoning arms spend
-    # thousands of tokens per call.
-    #
-    # Observed on Groq gpt-oss-120b (8000 TPM): "Used 5271, Requested 2763,
-    # try again in 255ms" aborted a benchmark cell 312 seconds and ~20
-    # completed examples in. The SDK honours Retry-After, so the fix is to let
-    # it wait rather than to hand-roll a backoff here.
-    _MAX_RETRIES = 6
+    reasoning_parameter = "reasoning_effort"
+    _reasoning_value_types = (str,)
+
+    def _reasoning_endpoint(self) -> str:
+        if self._client is not None:
+            endpoint = getattr(self._client, "base_url", None)
+            if endpoint is None:
+                raise ValueError("Cannot resolve this OpenAI-compatible client's endpoint")
+            return str(endpoint).rstrip("/")
+        endpoint = self._base_url or os.environ.get("OPENAI_BASE_URL")
+        import httpx
+        endpoint = "https://api.openai.com/v1" if endpoint is None else endpoint
+        return str(httpx.URL(endpoint)).rstrip("/")
+
+    # Maximum additional SDK attempts for retryable request failures.
+    # Two retries allow up to three HTTP attempts per SDK request.
+    # The SDK handles retry eligibility and waiting.
+    # Separate from strategy truncation and validation retries.
+    _MAX_RETRIES = 2
 
     def _get_client(self):
+        """Create the SDK client on first use and reuse it afterward."""
         if self._client is None:
             from openai import OpenAI
+
             kwargs: Dict[str, Any] = {"max_retries": self._MAX_RETRIES}
             if self._base_url:
                 kwargs["base_url"] = self._base_url
@@ -100,6 +100,18 @@ class OpenAICompatBackend(Backend):
     def default_model(self) -> str:
         return self._model_name
 
+    def cache_state(self) -> Optional[Dict[str, Any]]:
+        """Describe this adapter's configuration without exposing credentials."""
+        if type(self) is not OpenAICompatBackend:
+            # Subclasses must explicitly account for their additional behavior.
+            return None
+        return {
+            "base_url": self._base_url,
+            "default_model": self._model_name,
+            "reasoning_effort": self._reasoning_effort,
+            "allow_tool_use": self._allow_tool_use,
+        }
+
     def generate(
         self,
         prompt: str,
@@ -109,7 +121,6 @@ class OpenAICompatBackend(Backend):
         top_p: float = 1.0,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
-        think: bool = DEFAULT_THINK,
         **kwargs,
     ) -> GenerateResponse:
         return self.generate_chat(
@@ -119,7 +130,6 @@ class OpenAICompatBackend(Backend):
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             stop=stop,
-            think=think,
             **kwargs,
         )
 
@@ -132,86 +142,64 @@ class OpenAICompatBackend(Backend):
         top_p: float = 1.0,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
-        think: bool = DEFAULT_THINK,
         **kwargs,
     ) -> GenerateResponse:
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unsupported generation options: {names}")
+
         client = self._get_client()
         mdl = model or self._model_name
-        thinking_mode = get_thinking_mode(mdl)
-
-        # Single source of truth for what this model will actually do with the
-        # requested mode. The backend applies the resolution; it does not
-        # decide it, and no strategy branches on model name.
-        resolution = resolve_thinking(mdl, think)
-
-        # --- Resolve thinking behaviour per model family ---
-        if thinking_mode == ThinkingMode.ALWAYS_THINKS:
-            if not think:
-                logger.warning(
-                    "Model '%s' always generates reasoning traces — "
-                    "`think=False` has no effect. The result records "
-                    "effective_think=True and thinking_honoured=False so this "
-                    "call is not mistaken for a non-thinking condition.",
-                    mdl,
-                )
-            effective_messages = messages
-
-        elif thinking_mode == ThinkingMode.THINKING_TOGGLE:
-            if think:
-                effective_messages = messages
-            else:
-                effective_messages = append_no_think(messages)
-
-        else:
-            # NO_THINKING — model never reasons, flag is irrelevant
-            effective_messages = messages
 
         api_kwargs: Dict[str, Any] = {}
         if stop:
             api_kwargs["stop"] = list(stop)
+        if self._reasoning_effort is not None:
+            api_kwargs["reasoning_effort"] = self._reasoning_effort
 
-        response = client.chat.completions.create(
-            model=mdl,
-            messages=effective_messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_new_tokens,
-            **api_kwargs,
-        )
+        # Keep this optional SDK import local to the backend operation.
+        from openai import APIError, APITimeoutError
+
+        try:
+            response = client.chat.completions.create(
+                model=mdl,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_new_tokens,
+                **api_kwargs,
+            )
+        except APITimeoutError as exc:
+            raise BackendTimeoutError(f"{type(exc).__name__}: {exc}") from exc
+        except APIError as exc:
+            raise BackendCommunicationError(f"{type(exc).__name__}: {exc}") from exc
+
 
         choice = response.choices[0]
         raw_dump = response.model_dump() if hasattr(response, "model_dump") else None
 
-        # Validity guard, not error handling — see ToolUseDetected in base.py.
-        # This must run before the content is read: a tool call returns
-        # content=None, which would otherwise become "" and be indistinguishable
-        # from an ordinary parse failure further downstream.
+        # Check tool-use indicators before missing text becomes a parse failure.
+        # A tool-call response may have no text content.
         if not self._allow_tool_use:
             evidence = detect_tool_use(choice, raw_dump)
             if evidence is not None:
                 raise ToolUseDetected(
-                    f"Provider ran a tool for model {mdl!r} ({evidence}). This package "
-                    f"never declares tools, so a provider-side default is in play. The "
-                    f"returned value would measure an interpreter rather than the "
-                    f"model's reasoning, so it is refused. Disable server-side tools "
-                    f"for this model, or construct the backend with allow_tool_use=True "
-                    f"if you deliberately want tool-assisted numbers — they are not "
-                    f"spec-only execution reasoning and must not be reported as such."
+                    f"Response for model {mdl!r} contains tool-use indicators "
+                    f"({evidence}) and cannot be accepted as an unaided prediction. "
+                    "Set allow_tool_use=True to bypass this check. "
+                    "Bypassing the check does not execute tools."
                 )
 
         raw_text = (choice.message.content or "").strip()
-        tokens = input_tokens = output_tokens = None
-        if response.usage:
-            tokens = response.usage.completion_tokens
-            # getattr rather than attribute access: the usage object varies
-            # across OpenAI-compatible providers and a missing field must read
-            # as "not reported", not raise.
-            input_tokens = getattr(response.usage, "prompt_tokens", None)
-            output_tokens = getattr(response.usage, "completion_tokens", None)
-        # Map the provider's spelling onto {"stop", "length"}; the strategy
-        # layer tests for "length" exactly when deciding to retry. The
-        # un-normalised value is carried separately — the mapping is lossy and
-        # an unrecognised value is exactly the audit signal worth keeping.
+        input_tokens = output_tokens = None
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            # Missing usage fields remain unknown rather than being estimated.
+            input_tokens = getattr(usage, "prompt_tokens", None)
+            output_tokens = getattr(usage, "completion_tokens", None)
+
+        # Preserve the provider's original reason alongside the normalized value.
+        # Strategies use "length" to retry with a larger token budget.
         provider_finish_reason = getattr(choice, "finish_reason", None)
         finish_reason = normalize_finish_reason(provider_finish_reason, mdl)
 
@@ -220,12 +208,13 @@ class OpenAICompatBackend(Backend):
         return GenerateResponse(
             text=raw_text,
             model=mdl,
-            tokens_used=tokens,
+            tokens_used=output_tokens,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            requested_think=resolution.requested,
-            effective_think=resolution.effective,
-            thinking_honoured=resolution.honoured,
+            requested_reasoning=(
+                {"reasoning_effort": api_kwargs["reasoning_effort"]}
+                if "reasoning_effort" in api_kwargs else {}
+            ),
             finish_reason=finish_reason,
             provider_finish_reason=(
                 str(provider_finish_reason) if provider_finish_reason is not None else None
@@ -234,8 +223,10 @@ class OpenAICompatBackend(Backend):
         )
 
     def is_available(self) -> bool:
+        """Check SDK importability without contacting the provider."""
         try:
             import openai  # noqa: F401
+
             return True
         except ImportError:
             return False

@@ -1,28 +1,20 @@
-"""
-Hybrid / adaptive strategy.
+"""Route predictions to direct or structured-CoT prompting using heuristics.
 
-Routes each AI function call to the most appropriate prediction strategy
-based on heuristics about the task type. All strategies predict the result
-directly from the specification — no code is generated or executed.
+The classifier inspects signature/docstring keywords and selected input shapes.
+It chooses one existing strategy and delegates prediction to it, forwarding
+validation feedback when supplied.
 
-Current heuristics (rule-based; can be replaced with a learned classifier):
-- NLP/perception tasks (sentiment, classification, ...) -> direct
-- Simple operations (arithmetic, string ops, lookups) -> direct
-- Multimodal tasks (Image, Audio, Video inputs/outputs) -> direct
-- Algorithmic tasks (graph, sorting, DP, complex types) -> cot
-- Mathematical/numerical tasks (formulas, computation) -> cot
+These fixed rules do not establish which strategy is more accurate,
+faster, or cheaper for a particular request. Routing does not execute
+generated code or expand the runtime's supported input capabilities.
 
-PROVISIONAL: this is a candidate answer to open question #1 in CLAUDE.md
-("universal vs. task-specific prompting strategy"), not a validated one —
-it is not empirically benchmarked against plain `direct` or `cot`, and has
-no dedicated test coverage beyond classify_task() unit tests. Treat routing
-decisions as a heuristic prior, not a proven policy.
+Keyword matching uses whole-word boundaries after lowercasing and treating
+underscores as spaces. This supports snake_case identifiers while avoiding
+matches inside unrelated words.
 
-Keyword matching is whole-word only (regex \\b...\\b, underscores treated
-as word separators) specifically to avoid substring false positives, e.g.
-the old naive `"tag" in text` check used to fire on "postage"/"voltage",
-and `"path" in text` fired on "empathy"/"pathology". Don't revert to plain
-`kw in text` substring checks.
+The selected strategy is recorded in substrategy and in a raw-text prefix.
+The delegated strategy handles generation, parsing, and token-limit retries;
+the runtime handles input checks, output validation, and validation retries.
 """
 
 from __future__ import annotations
@@ -32,13 +24,12 @@ from typing import Any, Dict, Optional
 
 from ..backends.base import Backend
 from ..request import ExecuteRequest
-from ..types import ParsedSignature, parse_signature, Image, Audio, Video, Text, MediaObject
 from .base import Strategy, StrategyResult
-from .direct import DirectStrategy
 from .cot import CoTStrategy
+from .direct import DirectStrategy
 
 
-# Keywords suggesting NLP/perception tasks -> direct (pattern matching, no steps)
+# Keywords that route to direct prediction.
 _NLP_KEYWORDS = {
     "sentiment", "classify", "categorize", "summarize",
     "translate", "extract", "parse_text", "detect", "score_review",
@@ -46,7 +37,7 @@ _NLP_KEYWORDS = {
     "emotion", "intent", "language", "tone",
 }
 
-# Keywords suggesting algorithmic tasks -> cot (multi-step reasoning helps)
+# Algorithmic keywords used by the structured-CoT routing rule.
 _ALGO_KEYWORDS = {
     "sort", "search", "path", "dijkstra", "bfs", "dfs",
     "traverse", "shortest", "longest", "dynamic", "knapsack",
@@ -55,10 +46,11 @@ _ALGO_KEYWORDS = {
     "topological", "spanning", "optimize",
 }
 
-# Keywords suggesting mathematical/numerical tasks -> cot (step-by-step helps)
+# Mathematical keywords used by the structured-CoT routing rule.
 _MATH_KEYWORDS = {
     "integral", "derivative", "solve", "equation", "matrix",
-    "determinant", "eigenvalue", "regression", "interpolat",
+    "determinant", "eigenvalue", "regression",
+    "interpolate", "interpolation",
     "numerical", "approximate", "converge", "newton",
     "fourier", "transform", "probability", "distribution",
     "compute", "calculate", "formula",
@@ -66,16 +58,15 @@ _MATH_KEYWORDS = {
 
 
 def _compile_keyword_pattern(keywords: set[str]) -> re.Pattern:
-    """
-    Compile a whole-word regex for a keyword set.
+    """Compile literal keyword alternatives with word boundaries.
 
-    Underscores are treated as word separators (so "sort_items" and
-    "binary_search" line up with the "_"->" " normalisation applied to the
-    signature/docstring text in classify_task), and matching is anchored
-    with \\b on both sides so keywords can't fire as a substring of an
-    unrelated word.
+    Normalize underscores to spaces to match the normalization applied
+    to request signatures and docstrings.
     """
-    escaped = [re.escape(kw.replace("_", " ")) for kw in sorted(keywords, key=len, reverse=True)]
+    escaped = [
+        re.escape(keyword.replace("_", " "))
+        for keyword in sorted(keywords)
+    ]
     return re.compile(r"\b(?:" + "|".join(escaped) + r")\b")
 
 
@@ -85,22 +76,7 @@ _MATH_PATTERN = _compile_keyword_pattern(_MATH_KEYWORDS)
 
 
 class HybridStrategy(Strategy):
-    """
-    Adaptive strategy that picks direct or cot per-task.
-
-    Both sub-strategies predict results purely from the specification
-    (signature + docstring + inputs). The difference is whether the
-    model reasons step-by-step first (cot) or answers immediately
-    (direct).
-
-    Rationale:
-    - Direct is faster and cheaper. It works well for pattern-matching
-      tasks (NLP, perception) and simple operations where the model
-      can answer from training knowledge alone.
-    - CoT is slower but more accurate on multi-step reasoning tasks
-      (algorithms, math, complex logic) where intermediate steps
-      reduce error accumulation.
-    """
+    """Delegate each request to direct or CoT using fixed heuristics."""
 
     def __init__(self) -> None:
         self._direct = DirectStrategy()
@@ -110,50 +86,39 @@ class HybridStrategy(Strategy):
     def name(self) -> str:
         return "hybrid"
 
-    def classify_task(self, request: ExecuteRequest) -> str:
-        """
-        Classify a task and return the recommended strategy name.
+    def cache_state(self) -> dict[str, Any]:
+        """Include each delegate's class and configuration in the cache key."""
+        state = super().cache_state()
+        for attribute in ("_direct", "_cot"):
+            delegate = getattr(self, attribute)
+            state[attribute] = {
+                "strategy_class": (
+                    type(delegate).__module__,
+                    type(delegate).__qualname__,
+                ),
+                "strategy_state": delegate.cache_state(),
+            }
+        return state
 
-        Returns one of: 'direct', 'cot'.
-        """
+    def classify_task(self, request: ExecuteRequest) -> str:
+        """Return 'direct' or 'cot' using fixed request heuristics."""
         sig_lower = request.signature.lower()
         doc_lower = request.docstring.lower()
-        # Normalise "_" to " " so snake_case identifiers (e.g. "sort_items")
-        # line up with whole-word keyword matching instead of being glued
-        # into one unmatchable token.
+        # Normalize snake_case for whole-word matching.
         combined = (sig_lower + " " + doc_lower).replace("_", " ")
 
-        # Parse signature for structural hints
-        try:
-            parsed = parse_signature(request.signature)
-        except ValueError:
-            parsed = None
-
-        # Multimodal types -> direct (the model's perception IS the impl)
-        if parsed and _has_media_types(parsed):
-            return "direct"
-
-        # NLP/perception keywords -> direct
+        # NLP keywords take priority over mathematical/algorithmic keywords.
         if _NLP_PATTERN.search(combined):
             return "direct"
 
-        # Mathematical keywords -> cot (step-by-step reasoning)
-        if _MATH_PATTERN.search(combined):
+        if _MATH_PATTERN.search(combined) or _ALGO_PATTERN.search(combined):
             return "cot"
 
-        # Algorithmic keywords -> cot
-        if _ALGO_PATTERN.search(combined):
-            return "cot"
-
-        # Complex nested inputs (graphs, matrices) -> cot
+        # Route selected input shapes to structured-CoT prompting.
         if _has_complex_inputs(request.inputs):
             return "cot"
 
-        # Float return with computation-like docstring -> cot
-        if parsed and parsed.return_type is float:
-            return "cot"
-
-        # Default: direct (fastest, good enough for simple tasks)
+        # Use direct prediction when no routing rule matches.
         return "direct"
 
     def execute(
@@ -167,31 +132,24 @@ class HybridStrategy(Strategy):
         sub = self._cot if strategy_name == "cot" else self._direct
 
         result = sub.execute(request, backend, feedback=feedback)
-        # Report the routing decision as structured data. The raw_text prefix
-        # below predates this field and is kept for backward compatibility
-        # with traces and result CSVs already collected; new analysis should
-        # read `substrategy` rather than parsing the prefix.
+        # Record the selected route in structured metadata and raw text.
         result.substrategy = strategy_name
         result.raw_text = f"[hybrid -> {strategy_name}] " + result.raw_text
         return result
 
 
-def _has_media_types(parsed: ParsedSignature) -> bool:
-    """Check if any parameter or return type is a media type."""
-    media = (Image, Audio, Video, Text, MediaObject)
-    for p in parsed.params:
-        if isinstance(p.resolved_type, type) and issubclass(p.resolved_type, media):
-            return True
-    if isinstance(parsed.return_type, type) and issubclass(parsed.return_type, media):
-        return True
-    return False
-
-
 def _has_complex_inputs(inputs: Dict[str, Any]) -> bool:
-    """Heuristic: inputs with nested dicts/lists suggest algorithmic tasks."""
-    for v in inputs.values():
-        if isinstance(v, dict) and any(isinstance(vv, (list, dict, tuple)) for vv in v.values()):
+    """Match the input-shape heuristics used for CoT routing.
+
+    A dictionary input qualifies if an immediate value is a list,
+    dictionary, or tuple. A list input qualifies above twenty items.
+    """
+    for value in inputs.values():
+        if isinstance(value, dict) and any(
+            isinstance(item, (list, dict, tuple))
+            for item in value.values()
+        ):
             return True
-        if isinstance(v, list) and len(v) > 20:
+        if isinstance(value, list) and len(value) > 20:
             return True
     return False

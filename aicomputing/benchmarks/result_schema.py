@@ -1,35 +1,23 @@
 """
-The single per-example result schema shared by every benchmark oracle.
+Canonical per-invocation CSV schema for the manifest-driven benchmark runner.
 
-Before this module each oracle wrote its own column list, and they had drifted:
-different names for the same quantity, different orders, and columns present in
-one file and missing from another. Anything joining across benchmarks had to
-special-case each one.
+RESULT_COLUMNS defines output column order. The legacy oracle scripts retain
+their separate CSV formats.
 
-The schema exists to support two analyses:
+Rows record run and task identity, specifications and inputs, expected and
+predicted values, validation and failure diagnostics, contract revisions,
+reported usage, and generation settings.
 
-Paired comparison
-    `benchmark_item_id` is stable across every strategy and model, so
-    Direct-vs-enhanced comparisons on the same items are a join, not a
-    reconstruction. This is what makes McNemar tests and paired accuracy
-    differences possible later. `run_id` and `seed` identify the run the row
-    came from; `manifest_version` identifies the item selection.
+Correctness is supplied by the benchmark grader. Structural validation does
+not establish semantic correctness. Failure classification preserves explicit
+execution failures before considering whether an answer matches ground truth.
 
-Cost comparison
-    input/output/total tokens and `model_calls` are summed over EVERY model
-    call the invocation made, so a two-call strategy is charged for two calls.
+Token and model-call fields reflect accounting recorded in ExecuteResult.
+Unavailable usage remains unknown; failed calls may have incomplete accounting.
 
-Correctness vs. validity
-    `correct` is semantic: it compares against benchmark ground truth.
-    `validation_status` is structural: whether the value had the declared type.
-    They are independent, and `failure_type` keeps them that way -- a
-    structurally invalid output and a well-formed wrong answer are different
-    events, and a run that hit a provider error is neither.
-
-Deriving failure_type is the one piece of real logic here. The runtime sets
-execution-level failures (it can see a parse failure or a type violation); only
-the harness can see that a valid value disagrees with ground truth, so the
-semantic category is filled in here and never overrides a runtime failure.
+manifest_version records the manifest format version, not a unique experiment
+or item selection. Paired analysis also requires matching task invocations,
+data, inputs, and the relevant experiment settings.
 """
 
 from __future__ import annotations
@@ -37,13 +25,16 @@ from __future__ import annotations
 import csv
 import json
 import os
+import stat
+import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
+from uuid import uuid4
 
 from aicomputing.request import ExecuteResult, FailureType
 
-# Column order is the file format. Append new columns at the end rather than
-# inserting, so existing readers keep working.
+# Canonical column order for newly written CSV files.
+# Consumers should address columns by name; older files may use an earlier schema.
 RESULT_COLUMNS: List[str] = [
     # --- identity: what was run -------------------------------------------
     "run_id",
@@ -90,9 +81,6 @@ RESULT_COLUMNS: List[str] = [
     "dataset_revision",
     "invocation_pool",
     "return_type_source",
-    "requested_think",
-    "effective_think",
-    "thinking_honoured",
     "temperature",
     "top_p",
     "max_new_tokens",
@@ -100,10 +88,13 @@ RESULT_COLUMNS: List[str] = [
     "type_warnings",
     "raw_text",
     "prompts",
+    "reasoning_requests",
+    "reasoning_observations",
 ]
 
 
 def _json(value: Any) -> str:
+    """Encode a CSV field as JSON, falling back to string representations."""
     try:
         return json.dumps(value, default=str)
     except (TypeError, ValueError):
@@ -111,24 +102,21 @@ def _json(value: Any) -> str:
 
 
 def derive_failure_type(result: ExecuteResult, correct: bool) -> Optional[str]:
-    """
-    Classify the outcome, preferring the runtime's execution-level verdict.
+    """Classify a benchmark outcome without replacing explicit failures.
 
-    A runtime failure always wins over the semantic one. If the output could
-    not be parsed, or was withheld by STRICT validation, then the model never
-    produced an answer to be wrong about, and labelling it a wrong answer
-    would inflate the apparent semantic error rate with what are really
-    execution failures.
+    Validate existing failure labels first. If none is recorded, map known
+    generated-code execution failures, then use grader-supplied correctness.
+    Scoring eligibility is determined separately when building the row.
     """
+    # Validate explicit labels even when they are falsy or already excluded.
+    FailureType.is_scorable(result.failure_type)
     if result.failure_type:
         return result.failure_type
 
-    # Code-generation baseline outcomes. These are the model's program
-    # failing, not the provider failing, so they map to GENERATED_CODE_*
-    # (scorable) and never to provider_error. Reporting a program that does
-    # not run as an API failure would remove it from the denominator and
-    # flatter the baseline exactly where it is weakest.
+    # Generation/execution failures remain scorable model outcomes rather
+    # than being excluded as provider failures.
     codegen = {
+        "truncated": FailureType.GENERATED_CODE_TRUNCATED,
         "syntax_error": FailureType.GENERATED_CODE_SYNTAX,
         "runtime_error": FailureType.GENERATED_CODE_RUNTIME,
         "timeout": FailureType.GENERATED_CODE_TIMEOUT,
@@ -172,6 +160,18 @@ def build_row(
     """Assemble one schema-conformant result row."""
     checked = result.revised is not None      # a check ran at all
     failure = derive_failure_type(result, correct) or ""
+    if (
+        result.exec_status in ("truncated", "syntax_error", "runtime_error", "timeout", "error")
+        or failure in (
+            FailureType.PARSE,
+            FailureType.GENERATED_CODE_TRUNCATED,
+            FailureType.GENERATED_CODE_SYNTAX,
+            FailureType.GENERATED_CODE_RUNTIME,
+            FailureType.GENERATED_CODE_TIMEOUT,
+        )
+    ):
+        correct = False
+    failure_scorable = FailureType.is_scorable(failure)
     gen = generation or {}
     return {
         "run_id": run_id,
@@ -193,8 +193,7 @@ def build_row(
         "correct": correct,
         # Whether this invocation belongs in the capability denominator.
         # A provider outage is not the model being wrong.
-        "scorable": (result.scorable
-                     and FailureType.is_scorable(failure or None)),
+        "scorable": result.scorable and failure_scorable,
         "validation_status": result.validation_status,
         "failure_type": failure,
         "parse_status": result.parse_status or "",
@@ -203,8 +202,7 @@ def build_row(
         "revisions": int(bool(result.revised)) if checked else 0,
         "pre_revision_value": _json(result.pre_revision_value) if checked else "",
         "pre_revision_correct": "" if pre_revision_correct is None else pre_revision_correct,
-        # Latency is always a real number; None would crash the writer and
-        # lose the file at the end of a cell (see bench_args.execute_resilient).
+        # Record integer milliseconds; missing latency currently defaults to zero.
         "latency_ms": round(result.latency_ms or 0.0),
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
@@ -217,10 +215,6 @@ def build_row(
         "dataset_revision": dataset_revision or "",
         "invocation_pool": invocation_pool or "",
         "return_type_source": return_type_source or "",
-        # Thinking actually used, not what the strategy asked for.
-        "requested_think": result.requested_think,
-        "effective_think": result.effective_think,
-        "thinking_honoured": result.thinking_honoured,
         # Resolved generation settings, recorded so a row states the
         # configuration it was produced under rather than requiring the
         # manifest to be consulted separately.
@@ -231,25 +225,73 @@ def build_row(
         "type_warnings": "; ".join(result.type_warnings),
         "raw_text": result.raw_text,
         "prompts": _json(result.prompts),
+        # Native settings sent for recorded responses, not verified reasoning mode.
+        "reasoning_requests": _json(result.reasoning_requests),
+        "reasoning_observations": _json(result.reasoning_observations),
     }
 
 
 def write_results(path: str, rows: Iterable[Dict[str, Any]]) -> str:
-    """Write rows as CSV in the canonical column order."""
-    rows = list(rows)
+    """Write a complete CSV before replacing the destination.
+
+    Unknown fields raise; missing fields are written as blanks.
+    Existing permission bits are preserved; new files use temporary-file defaults.
+    """
     directory = os.path.dirname(os.path.abspath(path))
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({c: row.get(c, "") for c in RESULT_COLUMNS})
+    os.makedirs(directory, exist_ok=True)
+
+    try:
+        existing_mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            newline="",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".results-",
+            suffix=".csv",
+            delete=False,
+        ) as fh:
+            temporary_path = fh.name
+            writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+        if existing_mode is not None:
+            os.chmod(temporary_path, existing_mode)
+
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except PermissionError:
+                if os.name != "nt":
+                    raise
+                # Windows cannot delete a read-only temporary output.
+                os.chmod(temporary_path, stat.S_IWRITE)
+                os.unlink(temporary_path)
+
     return path
 
 
 def new_run_id(model: str, benchmark: str, strategy: str) -> str:
-    """A short, sortable, human-readable identifier for one cell."""
+    """Combine a UTC timestamp, readable labels and a random run identifier."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    safe = lambda s: "".join(c if c.isalnum() or c in "-._" else "-" for c in s)
-    return f"{stamp}_{safe(model)}_{safe(benchmark)}_{safe(strategy)}"
+
+    def safe(value: str) -> str:
+        return "".join(
+            character if character.isalnum() or character in "-._" else "-"
+            for character in value
+        )
+
+    return (
+        f"{stamp}_{safe(model)}_{safe(benchmark)}_{safe(strategy)}"
+        f"_{uuid4().hex}"
+    )

@@ -1,77 +1,65 @@
-"""
-Code generation + execution baseline.
+"""Generate and execute Python implementations for benchmark comparison.
 
-THIS IS NOT AN AI COMPUTING STRATEGY. It represents the *traditional*
-approach: generate code from a spec, execute it, return the real output.
-It lives in benchmarks/baselines/ because it exists solely to compare
-against true AI computing (spec-only prediction).
+This evaluation-only strategy is supplied explicitly to the runtime and is
+excluded from the specification-only oracle strategy registry. The model
+receives the signature and docstring; the generated function receives inputs.
+Its actual return value is used without a predicted-answer fallback.
 
-The comparison answers the question: "When does predicting the output
-from a spec alone match or beat generating-and-running actual code?"
+Generated truncation, syntax errors, program errors and worker-wait timeouts
+are scorable outcomes. Invalid declared headers and execution-machinery
+failures propagate for the benchmark wrapper to classify as harness failures.
+Provider exceptions also propagate for their existing classification.
 
-Scoring rule (thesis §5.5)
---------------------------
-A generation that does not execute scores as **wrong**. There is no fallback
-to reading an answer out of the generated source text: doing so would let the
-baseline borrow the spec-only mechanism it is meant to be compared against,
-understating the very gap §6.3 reports. The failure category is recorded in
-`StrategyResult.exec_status` so the execution-failure rate is reported
-alongside accuracy rather than folded into it:
-
-    ok            the generated function ran and returned a value
-    syntax_error  the generated code does not parse
-    runtime_error it raised, or defined no function of the expected name
-    timeout       it exceeded the timeout and was terminated
-
-None of these is a provider failure: the LLM answered successfully in every
-case, and it is the PROGRAM that failed. They map onto the
-FailureType.GENERATED_CODE_* categories, which are scorable, and stay
-separate from provider_error, which is not.
-
-This is not a security boundary — see the restricted-builtins note on
-_build_safe_globals.
-
-Usage in benchmarks:
-    python benchmarks/gsm8k_oracle.py --baseline --provider groq --model ...
-
-or directly:
-    from benchmarks.baselines.code_gen_baseline import CodeGenBaseline
-
-    baseline = CodeGenBaseline()
-    result = baseline.execute(request, backend)
+The restricted environment is not a security boundary. Results must support
+multiprocessing serialization. See _sandbox_exec for the timeout's scope.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
+import importlib
 import logging
+import math
 import multiprocessing
 import re
+import textwrap
 from typing import Any, Dict, Optional
 
 from aicomputing.backends.base import Backend
+from aicomputing.parsing import ParseOutcome
 from aicomputing.prompting import build_codegen_prompt
 from aicomputing.request import ExecuteRequest
-from aicomputing.strategies.base import CallStats, Strategy, StrategyResult
+from aicomputing.strategies.base import (
+    CallStats, Strategy, StrategyResult, generate_with_retry,
+)
 
 logger = logging.getLogger("aicomputing")
 
 
+class _GeneratedCodeError(RuntimeError):
+    """The worker reported a failure in the generated program."""
+
+
+class _GeneratedCodeTimeout(TimeoutError):
+    """No generated outcome was ready within the execution wait."""
+
+
 # Restricted builtins for sandboxed execution
 _SAFE_BUILTINS = {
-    "abs", "all", "any", "bin", "bool", "chr", "dict", "divmod",
-    "enumerate", "filter", "float", "format", "frozenset", "hash",
-    "hex", "int", "isinstance", "issubclass", "iter", "len", "list",
-    "map", "max", "min", "next", "oct", "ord", "pow", "print",
-    "range", "repr", "reversed", "round", "set", "slice", "sorted",
-    "str", "sum", "tuple", "type", "zip",
+    "__build_class__",
+    "abs", "all", "any", "bin", "bool", "bytes", "callable", "chr",
+    "dict", "divmod", "enumerate", "filter", "float", "format",
+    "frozenset", "getattr", "hash", "hex", "int", "isinstance",
+    "issubclass", "iter", "len", "list", "map", "max", "min", "next",
+    "object", "oct", "ord", "pow", "print", "range", "repr", "reversed",
+    "round", "set", "slice", "sorted", "str", "sum", "tuple", "type", "zip",
     "True", "False", "None",
 }
 
 
-# Modules the generated code may use. Injected as globals AND importable, so
-# that both `math.sqrt(x)` and `import math` work. Kept as one list because the
-# codegen prompt names it to the model — see prompting.build_codegen_prompt.
+# Modules available through the restricted environment and import hook.
+# Keep aligned with the names in prompting.build_codegen_prompt.
 _ALLOWED_MODULES = (
     "math", "json", "re", "itertools", "functools",
     "collections", "string", "statistics",
@@ -79,42 +67,44 @@ _ALLOWED_MODULES = (
 
 
 def _build_safe_globals() -> Dict[str, Any]:
+    """Build the restricted environment exposed through __builtins__.
+
+    Include standard exception classes for ordinary raising and handling.
+    Only the listed module roots are importable. This mapping is not a
+    security boundary.
     """
-    Build a restricted globals dict for exec().
+    safe = {
+        name: getattr(builtins, name)
+        for name in _SAFE_BUILTINS
+    }
+    safe.update({
+        name: value
+        for name, value in vars(builtins).items()
+        if isinstance(value, type) and issubclass(value, BaseException)
+    })
 
-    Imports
-    -------
-    `safe["__builtins__"] = safe` removes __import__ along with everything else
-    not whitelisted, which made any `import re` in generated code fail with
-    "ImportError: __import__ not found". Models write that line idiomatically,
-    and it accounted for 23 of the 30 baseline failures in the first pilot — a
-    harness restriction being recorded as a code-generation failure.
-
-    The prompt now tells the model these modules are pre-injected, but a
-    restricted __import__ is provided as well rather than relying on the model
-    to comply: a baseline that fails whenever the model writes an idiomatic
-    import is measuring instruction-following, not code generation.
-
-    This is not a security boundary. It narrows what generated code reaches by
-    accident; it does not contain code written to escape. The isolation that
-    matters is the separate process with a timeout in _sandbox_exec.
-    """
-    import builtins
-    import importlib
-
-    safe = {k: getattr(builtins, k) for k in _SAFE_BUILTINS if hasattr(builtins, k)}
-
-    modules = {name: importlib.import_module(name) for name in _ALLOWED_MODULES}
+    modules = {
+        name: importlib.import_module(name)
+        for name in _ALLOWED_MODULES
+    }
     safe.update(modules)
 
-    def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    def _restricted_import(
+        name, globals=None, locals=None, fromlist=(), level=0,
+    ):
+        if level != 0:
+            raise ImportError(
+                "Relative imports are unavailable in standalone generated code"
+            )
+
         root = name.split(".")[0]
         if root not in modules:
             raise ImportError(
                 f"import of {name!r} is not available in this sandbox; "
                 f"allowed: {', '.join(_ALLOWED_MODULES)}"
             )
-        return modules[root] if not fromlist else importlib.import_module(name)
+
+        return builtins.__import__(name, globals, locals, fromlist, level)
 
     safe["__import__"] = _restricted_import
     safe["__builtins__"] = safe
@@ -122,78 +112,124 @@ def _build_safe_globals() -> Dict[str, Any]:
 
 
 def _extract_function_body(raw: str) -> str:
-    """Clean up model output to get just the function body."""
-    text = raw.strip()
-    text = re.sub(r"^```(?:python)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    text = text.strip()
-    text = re.split(r"\nif __name__\s*==", text)[0]
+    """Remove output fences without stripping the first code line's indentation."""
+    text = raw.strip("\r\n")
+    text = re.sub(r"\A\s*```(?:python)?[ \t]*(?:\r?\n)?", "", text)
+    text = re.sub(r"\s*```[ \t\r\n]*\Z", "", text)
     return text
+
+
+def _parse_statements(source: str) -> tuple[list[ast.stmt], bool]:
+    """Parse bare or indented statements; report whether a block was needed."""
+    try:
+        return ast.parse(source).body, False
+    except IndentationError:
+        block = ast.parse("if True:\n" + source).body[0]
+        return block.body, True
 
 
 def _assemble_function(body: str, signature: str, docstring: str,
                        func_name: str) -> str:
-    """
-    Turn the model's output into a module that defines `func_name`.
+    """Keep a complete target definition or wrap the returned statements.
 
-    Two shapes are accepted because models produce both:
-
-      * a bare body, which is what the prompt asks for, and which is wrapped
-        in the declared signature here;
-      * a complete `def`, which is returned unchanged.
-
-    Deciding by parsing rather than by looking for a leading "def " matters:
-    output that begins with a helper function and defines the target further
-    down is still a complete definition, and indenting it would corrupt it.
-    Unparseable output falls through to the wrapping path, where the sandbox
-    reports the SyntaxError as an ordinary execution failure.
+    Leading indentation is accepted as one enclosing block. Unindented
+    complete definitions remain unchanged; indented definitions are rendered
+    from their AST. Invalid source is passed to the compilation failure path.
     """
     try:
-        tree = ast.parse(body)
+        statements, indented = _parse_statements(body)
     except SyntaxError:
         return _wrap_body(body, signature, docstring)
-    defines = any(isinstance(n, ast.FunctionDef) and n.name == func_name
-                  for n in tree.body)
-    return body if defines else _wrap_body(body, signature, docstring)
+    defines = any(isinstance(node, ast.FunctionDef) and node.name == func_name
+                  for node in statements)
+    if defines:
+        if indented:
+            module = ast.Module(body=statements, type_ignores=[])
+            return ast.unparse(module) + "\n"
+        return body
+    return _wrap_body(body, signature, docstring)
 
 
 def _wrap_body(body: str, signature: str, docstring: str) -> str:
-    """Wrap a bare function body in its declared signature and docstring."""
-    out = f"def {signature}:\n" + f'    """{docstring}"""\n'
-    for line in body.splitlines():
-        if line.strip():
-            out += (line if line.startswith(("    ", "\t")) else "    " + line) + "\n"
-        else:
-            out += "\n"
-    return out
+    """Wrap parsed statements while preserving nesting and string values."""
+    header = f"def {signature}:\n    {docstring!r}\n"
+    try:
+        statements, _ = _parse_statements(body)
+        function = ast.parse(header).body[0]
+        function.body.extend(statements)
+        return ast.unparse(function) + "\n"
+    except SyntaxError:
+        # Keep malformed output in the existing compile-and-score path.
+        return header + textwrap.indent(body, "    ")
 
 
 def _extract_func_name(signature: str) -> str:
-    """Extract function name from signature string."""
-    m = re.match(r"\s*(\w+)\s*\(", signature)
-    return m.group(1) if m else "func"
+    """Validate a Python function header and return its normalized name."""
+    if not isinstance(signature, str):
+        raise TypeError("signature must be a string")
 
-
-def _exec_worker(func_code: str, func_name: str, inputs: Dict[str, Any], conn) -> None:
-    """
-    Child-process entry point: exec the generated function and send back
-    its return value. Must be module-level so it survives pickling under
-    the spawn start method (Windows).
-    """
     try:
-        safe_globals = _build_safe_globals()
-        local_ns: Dict[str, Any] = {}
-        compiled = compile(func_code, filename="<codegen_baseline>", mode="exec")
-        exec(compiled, safe_globals, local_ns)
-        if func_name not in local_ns:
-            conn.send(("error", f"Generated code did not define function {func_name!r}"))
-            return
-        conn.send(("ok", local_ns[func_name](**inputs)))
-    except BaseException as exc:  # includes the unpicklable-result case below
+        module = ast.parse(f"def {signature}:\n    pass\n")
+        compile(module, filename="<codegen_signature>", mode="exec")
+    except SyntaxError as exc:
+        raise ValueError(
+            f"Invalid Python function signature: {signature!r}"
+        ) from exc
+
+    if (
+        len(module.body) != 1
+        or not isinstance(module.body[0], ast.FunctionDef)
+        or len(module.body[0].body) != 1
+        or not isinstance(module.body[0].body[0], ast.Pass)
+    ):
+        raise ValueError(f"Invalid Python function signature: {signature!r}")
+
+    return module.body[0].name
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """Keep error reporting usable even when an exception cannot be formatted."""
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except BaseException:
+        return f"{type(exc).__name__}: error message unavailable"
+
+
+def _exec_worker(
+    func_code: str,
+    func_name: str,
+    inputs: Dict[str, Any],
+    conn,
+) -> None:
+    """Execute generated code in a child process and send its outcome."""
+    try:
         try:
-            conn.send(("error", f"{type(exc).__name__}: {exc}"))
-        except Exception:
-            conn.send(("error", "generated code raised an unreportable error"))
+            namespace: Dict[str, Any] = {
+                "__builtins__": _build_safe_globals(),
+                "__name__": "__aicomputing_generated__",
+            }
+        except Exception as exc:
+            conn.send(("harness_error", _describe_exception(exc)))
+            return
+
+        try:
+            compiled = compile(
+                func_code, filename="<codegen_baseline>", mode="exec",
+            )
+            # Functions must see definitions made by the same generated code.
+            exec(compiled, namespace)
+            if func_name not in namespace:
+                message = (
+                    "error",
+                    f"Generated code did not define function {func_name!r}",
+                )
+            else:
+                message = ("ok", namespace[func_name](**inputs))
+        except BaseException as exc:
+            message = ("error", _describe_exception(exc))
+
+        # Transport errors must not be reported as generated-program errors.
+        conn.send(message)
     finally:
         conn.close()
 
@@ -207,6 +243,19 @@ class CodeGenBaseline(Strategy):
     """
 
     def __init__(self, timeout: float = 10.0) -> None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError("timeout must be a positive, finite number of seconds")
+
+        try:
+            timeout = float(timeout)
+        except OverflowError as exc:
+            raise ValueError(
+                "timeout must be a positive, finite number of seconds"
+            ) from exc
+
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive, finite number of seconds")
+
         self._timeout = timeout
 
     @property
@@ -219,87 +268,79 @@ class CodeGenBaseline(Strategy):
         backend: Backend,
         feedback: Optional[dict] = None,
     ) -> StrategyResult:
+        func_name = _extract_func_name(request.signature)
         prompt = build_codegen_prompt(
             signature=request.signature,
             docstring=request.docstring,
         )
-
-        response = backend.generate(
-            prompt,
-            model=request.model,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            max_new_tokens=max(request.max_new_tokens or 0, 512),
+        if feedback:
+            prompt = (
+                f"{prompt}\n\n"
+                f"Previous generated response:\n{feedback.get('raw_output', '')}\n\n"
+                f"Validation error: {feedback.get('error', '')}\n"
+                "Correct the implementation to satisfy the original specification "
+                "and address the validation error. Return Python code only, "
+                "using the implementation format requested above."
+            )
+        initial_budget = (
+            request.max_new_tokens if request.max_new_tokens is not None else 512
         )
 
-        # One generation call; recorded so the baseline appears in the cost
-        # comparison on the same footing as the spec-only arms.
-        stats = CallStats().record(response)
+        def call(budget: int):
+            return backend.generate(
+                prompt, model=request.model, temperature=request.temperature,
+                top_p=request.top_p, max_new_tokens=budget,
+            )
 
-        body = _extract_function_body(response.text)
-        func_name = _extract_func_name(request.signature)
+        stats = CallStats()
+        body, response, retries, budget = generate_with_retry(
+            call=call, parse=_extract_function_body, initial_budget=initial_budget,
+            stats=stats, model_name=request.model or backend.default_model,
+        )
+        truncated = response.finish_reason == "length"
+        value = None
+        exec_status = "truncated" if truncated else "ok"
+        error_message = (
+            "Generation remained truncated after token-budget retries."
+            if truncated else None
+        )
 
-        # Reconstruct the full function.
-        #
-        # The prompt asks for a body, but models frequently return a complete
-        # `def` instead. Wrapping one of those in another `def` produced a
-        # nested definition whose body sat at the same indentation as the inner
-        # header - an IndentationError scored as a code-generation failure when
-        # the generated code was in fact fine. That was 10 of 30 baseline
-        # failures on the first pilot. If the model already defined the target
-        # function, its code is used as written.
-        func_code = _assemble_function(body, request.signature,
-                                       request.docstring, func_name)
-
-        # Execute in sandbox.
-        #
-        # SCORING RULE (thesis §5.5): a generation that does not execute scores
-        # as WRONG. There is deliberately no fallback to parsing the generated
-        # source text for an answer.
-        #
-        # The previous behaviour did exactly that, and it is not a conservative
-        # choice — it is a contaminating one. This baseline's whole claim is
-        # "generate code, run it, return the real output". When the code does
-        # not run, reading a value out of the source text instead means the
-        # baseline silently borrows the spec-only mechanism it exists to be
-        # compared against, so §6.3 would be measuring the gap between
-        # spec-only prediction and a mixture that already contains it. The
-        # measured gap would be understated and the baseline's accuracy
-        # inflated, in an amount that varies with how often generation fails.
-        #
-        # The failure is recorded rather than hidden: exec_status carries the
-        # category so the execution-failure rate is reportable alongside
-        # accuracy instead of being folded into it.
-        # Compile separately from running so a program that does not parse is
-        # distinguishable from one that parses and then raises. Both are the
-        # model's fault, but they say different things about what generation
-        # got wrong, and neither is a provider failure.
-        exec_status = "ok"
-        try:
-            compile(func_code, filename="<codegen_baseline>", mode="exec")
-        except SyntaxError:
-            exec_status = "syntax_error"
-            value = None
-            logger.info("[codegen] generated code does not parse; scored as wrong")
-        if exec_status == "ok":
+        # Never execute a prefix still marked as truncated after exhaustion.
+        if not truncated:
+            func_code = _assemble_function(
+                body, request.signature, request.docstring, func_name,
+            )
             try:
-                value = self._sandbox_exec(func_code, func_name, request.inputs)
-            except TimeoutError:
-                value, exec_status = None, "timeout"
-                logger.info("[codegen] generated code timed out; scored as wrong")
-            except Exception as exc:
-                value, exec_status = None, "runtime_error"
-                logger.info("[codegen] generated code raised (%s); scored as wrong",
-                            type(exc).__name__)
+                compile(func_code, filename="<codegen_baseline>", mode="exec")
+            except SyntaxError as exc:
+                exec_status = "syntax_error"
+                error_message = f"Generated code has a syntax error at line {exc.lineno}: {exc.msg}"
+                logger.info("[codegen] generated code does not parse; scored as wrong")
+            if exec_status == "ok":
+                try:
+                    value = self._sandbox_exec(func_code, func_name, request.inputs)
+                except _GeneratedCodeTimeout:
+                    exec_status = "timeout"
+                    error_message = f"Generated code exceeded the {self._timeout}s execution timeout."
+                    logger.info("[codegen] generated code timed out; scored as wrong")
+                except _GeneratedCodeError as exc:
+                    exec_status = "runtime_error"
+                    error_message = f"Generated code failed: {exc}"
+                    logger.info("[codegen] %s; scored as wrong", error_message)
 
+        # Usage covers every returned response; raw text is the final response.
         return StrategyResult(
             value=value,
             prompts=[prompt],
             raw_text=f"[codegen {exec_status}] {response.text}",
             tokens_used=response.tokens_used,
             provider_finish_reason=response.provider_finish_reason,
+            token_budget_used=budget,
+            retries=retries,
             exec_status=exec_status,
             call_stats=stats,
+            parse_status=ParseOutcome.FAILED if exec_status != "ok" else None,
+            parse_error=error_message,
         )
 
     def _sandbox_exec(
@@ -308,36 +349,55 @@ class CodeGenBaseline(Strategy):
         func_name: str,
         inputs: Dict[str, Any],
     ) -> Any:
-        """
-        Execute generated code in a restricted environment, in a separate
-        process so `self._timeout` can actually be enforced.
+        """Run generated source in a child process and receive its outcome.
 
-        A generated infinite loop cannot be interrupted in-process (signal
-        alarms are POSIX-only and threads are not killable), so the child
-        is terminated on timeout and TimeoutError is raised.
+        The timeout bounds waiting for result-pipe readiness after start()
+        returns. If this wait expires, an active worker is terminated and a
+        late generated outcome counts as _GeneratedCodeTimeout. Process
+        startup, receiving the complete payload and cleanup are not bounded
+        by this wait.
+
+        Explicit worker program errors received within the wait become
+        _GeneratedCodeError. Setup, startup and transport errors propagate
+        as harness failures, including after the wait expires.
         """
         parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
-        proc = multiprocessing.Process(
-            target=_exec_worker,
-            args=(func_code, func_name, inputs, child_conn),
-        )
-        proc.start()
-        child_conn.close()  # only the child keeps the sending end open
-
+        started = False
         try:
-            if not parent_conn.poll(self._timeout):
-                raise TimeoutError(
-                    f"Generated code exceeded the {self._timeout}s timeout"
-                )
+            proc = multiprocessing.Process(
+                target=_exec_worker,
+                args=(func_code, func_name, inputs, child_conn),
+            )
+            proc.start()
+            started = True
+            child_conn.close()  # only the child keeps the sending end open
+            wait_expired = not parent_conn.poll(self._timeout)
+            if wait_expired:
+                if proc.is_alive():
+                    raise _GeneratedCodeTimeout(
+                        f"Generated code exceeded the {self._timeout}s timeout"
+                    )
+                if not parent_conn.poll(0.0):
+                    raise RuntimeError("Execution worker exited without returning a result")
             status, payload = parent_conn.recv()
         except EOFError as exc:
-            raise RuntimeError("Generated code died without returning a result") from exc
+            raise RuntimeError("Execution worker exited without returning a result") from exc
         finally:
+            child_conn.close()
             parent_conn.close()
-            if proc.is_alive():
-                proc.terminate()
-            proc.join()
+            if started:
+                if proc.is_alive():
+                    proc.terminate()
+                proc.join()
 
+        if wait_expired and status in ("ok", "error"):
+            raise _GeneratedCodeTimeout(
+                f"Generated code exceeded the {self._timeout}s timeout"
+            )
         if status == "error":
-            raise RuntimeError(payload)
-        return payload
+            raise _GeneratedCodeError(payload)
+        if status == "harness_error":
+            raise RuntimeError(f"Execution worker setup failed: {payload}")
+        if status == "ok":
+            return payload
+        raise RuntimeError(f"Unknown execution worker status: {status!r}")

@@ -32,13 +32,12 @@ No reference implementation is ever executed here.
               the other six build `results` from an expression and are
               reported as ineligible rather than silently dropped.
 
-  MBPP+       `test_list` holds discrete assert strings. Only the canonical
-              `assert f(<literals>) == <literal>` form is accepted. Asserts
-              that wrap the call (`assert set(f(x)) == set(y)`) are skipped
-              because the comparison, not just the value, carries meaning —
-              treating the wrapped operand as the expected value would score
-              a correct answer wrong. 356 of 378 items have at least one
-              usable assert, which is ample for the ~200 required.
+  MBPP+       a frozen ground-truth cache can supply base and plus invocations
+              with expected values computed offline. Loading it does not
+              execute the reference implementation. Otherwise, `test_list`
+              supplies canonical positional
+              `assert f(<literals>) == <literal>` cases; wrapped and
+              keyword-bearing calls are skipped.
 
 Invocation pool policy
 ----------------------
@@ -52,23 +51,13 @@ Invocation pool policy
               tasks, whereas content matching classified 100% with 0
               unlabelled.
 
-  MBPP+       BASE ONLY, and this is a methodological limitation rather than
-              a choice. MBPP+ ships 1,174 base and 39,841 plus inputs, but
-              expected outputs for NONE of them: neither the evalplus package
-              nor the HF build carries a results list, and the HF `test`
-              script has no literal inputs/results pair. The only MBPP+
-              ground truth that exists as data is in `test_list`, which
-              covers base inputs alone (verified pool: 1,102 base).
-
-              Obtaining expected values for the plus inputs would require
-              EXECUTING the reference implementation. That is not done here.
-              Running the hidden canonical solution to manufacture ground
-              truth is a different methodological commitment -- it makes the
-              benchmark's answers a product of code this harness executed
-              rather than of published data -- and it is the maintainer's
-              decision, not this module's. It is recorded in the manifest as
-              `invocation_pool_policy` so the write-up can state the
-              limitation instead of implying MBPP+ plus inputs were used.
+  MBPP+       frozen invocations for cached items; available records can come
+              from the base and plus pools. Items without cached ground truth
+              use base-only cases parsed from `test_list`.
+              `scripts/build_mbpp_ground_truth.py` executes canonical solutions
+              offline to build that cache, separately from loading specifications.
+              Each selected invocation records its actual `pool` label, and
+              `invocation_pool_policy` summarizes those labels in the manifest.
 
 
 What the model is shown
@@ -94,6 +83,8 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from aicomputing.types import parse_signature
 
 # HuggingFace dataset IDs. Pinned here rather than inline so a provider change
 # is a one-line edit; both are public and require no token.
@@ -287,6 +278,8 @@ def load_humanevalplus(*, keep_doctests: bool = False) -> List[SpecItem]:
         task_id = row["task_id"]
         try:
             signature = _humaneval_signature(row["prompt"])
+            # Reject unusable signatures before they enter the selection pool.
+            parse_signature(signature)
         except ValueError as exc:
             items.append(SpecItem(task_id, "", "", row["entry_point"],
                                   ineligible_reason=str(exc)))
@@ -348,7 +341,7 @@ def _mbpp_signature(code: str, entry_point: Optional[str] = None) -> Tuple[str, 
 
 def _mbpp_invocations(test_list: Sequence[str], entry_point: str,
                       names: Sequence[str]) -> List[Invocation]:
-    """Parse the canonical `assert f(<literals>) == <literal>` asserts."""
+    """Parse canonical positional `assert f(<literals>) == <literal>` asserts."""
     out: List[Invocation] = []
     for i, src in enumerate(test_list):
         try:
@@ -365,6 +358,9 @@ def _mbpp_invocations(test_list: Sequence[str], entry_point: str,
         # A wrapped call (set(f(x)) == ...) means the comparison itself carries
         # semantics; the operand is not the function's return value.
         if not (isinstance(call, ast.Call) and getattr(call.func, "id", None) == entry_point):
+            continue
+        # Keyword arguments cannot be reconstructed by positional mapping.
+        if call.keywords:
             continue
         try:
             values = [ast.literal_eval(a) for a in call.args]
@@ -396,23 +392,41 @@ def load_mbpp_ground_truth(path: str = MBPP_GROUND_TRUTH) -> Optional[Dict[str, 
     provenance -- never the implementation -- so nothing downstream can expose
     a reference solution even by accident.
 
+    Decode typed inputs and expected values. Legacy or unknown cache formats
+    must be rebuilt; their original value types cannot be inferred safely.
     Returns None when the cache is absent, in which case MBPP+ falls back to
     base-only invocations from `test_list`.
     """
     if not os.path.exists(path):
         return None
+    from mbpp_ground_truth import (
+        GROUND_TRUTH_VERSION, VALUE_ENCODING, decode_value,
+    )
+
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+        cache = json.load(fh)
+    if (type(cache) is not dict
+            or type(cache.get("ground_truth_version")) is not int
+            or cache["ground_truth_version"] != GROUND_TRUTH_VERSION
+            or cache.get("value_encoding") != VALUE_ENCODING):
+        raise ValueError(
+            "Unsupported MBPP ground-truth cache; rebuild it with "
+            "scripts/build_mbpp_ground_truth.py"
+        )
+    for task in cache["tasks"].values():
+        for inv in task["invocations"]:
+            inv["inputs"] = decode_value(inv["inputs"])
+            inv["expected"] = decode_value(inv["expected"])
+    return cache
 
 
 def load_mbppplus(*, ground_truth_path: str = MBPP_GROUND_TRUTH) -> List[SpecItem]:
     """
     Load MBPP+ as SpecItems. Ineligible items are returned, flagged.
 
-    Invocations come from the frozen ground-truth cache when it exists, giving
-    base + plus; otherwise from `test_list`, which covers base only. The
-    fallback keeps the adapter usable on a machine where the cache has not been
-    built, and `pool` records which inputs were actually available.
+    Cached items use their frozen invocation records. Other items fall back
+    to base-only cases from `test_list`. Each invocation's `pool` label records
+    the actual source used.
     """
     from datasets import load_dataset
 

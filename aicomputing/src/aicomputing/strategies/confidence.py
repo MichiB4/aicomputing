@@ -1,24 +1,22 @@
-"""
-Confidence-gated strategy (self-assessed reasoning).
+"""Predict outputs with a prompt that lets the model choose visible tracing.
 
-A single prompt, a single call: the model decides for itself, per task,
-whether to answer immediately or trace its reasoning first. See the
-module docstring in prompting.py (CONFIDENCE_SYSTEM) for the rationale —
-in short, this replaces `hybrid`'s hand-written keyword classifier with a
-decision the model makes about its own confidence, so the routing logic
-has nothing to maintain and nothing to go stale as models improve.
+The prompt asks the model to answer immediately when confident, otherwise
+trace execution before returning the predicted answer in a result object.
+The strategy does not measure confidence, verify calibration, or extract
+the chosen response path into a separate result field.
 
-PROVISIONAL: like `hybrid`, this is an unvalidated candidate strategy, not
-a benchmarked-and-chosen default. It trades hybrid's cheap determinism for
-reliance on the model's self-calibration, which may be poorly calibrated
-on small/local models (e.g. always claiming confidence). Worth measuring
-directly — e.g. does the model actually skip the trace on easy tasks and
-use it on hard ones, and does that ratio shift with model capability.
+Both response styles are requested through the same prompt. The final
+response text is retained, including any visible trace the model supplies.
+These instructions do not establish prediction correctness.
 
-Token budget: always sized for the "thinking" case (8192, doubling on
-truncation) since the model may choose to trace at any point — we can't
-know in advance which path it takes, unlike `direct` (never traces) or
-`cot` (always traces).
+Native reasoning is configured by the backend rather than selected by
+this strategy. The prompt only offers a choice of visible response style.
+The default initial output-token budget is 8192; request.max_new_tokens
+overrides that starting allowance.
+
+Token-limit retries can make up to five additional calls, doubling the
+budget without a package-level cap. Runtime validation retries may repeat
+the strategy according to request.max_retries.
 """
 
 from __future__ import annotations
@@ -27,15 +25,20 @@ from typing import Optional
 
 from ..backends.base import Backend
 from ..model_config import get_token_budget
-from ..parsing import parse_result
 from ..prompting import build_confidence_prompt, build_retry_prompt
 from ..request import ExecuteRequest
-from .base import (CallStats, Strategy, StrategyResult,
-                   generate_with_retry, make_parser, _is_strict)
+from .base import (
+    CallStats,
+    Strategy,
+    StrategyResult,
+    _is_strict,
+    generate_with_retry,
+    make_parser,
+)
 
 
 class ConfidenceStrategy(Strategy):
-    """Let the model decide, per call, whether it needs to reason first."""
+    """Ask the model to choose whether to trace before answering."""
 
     def __init__(self, include_fewshot: bool = True) -> None:
         self._include_fewshot = include_fewshot
@@ -63,13 +66,10 @@ class ConfidenceStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        think = request.think if request.think is not None else True
-        # Budget sizing always assumes the model might trace, regardless of
-        # the native `think` toggle above — even non-thinking models can
-        # still write a visible trace in the completion text (as `cot`
-        # already does for them).
+        # Allow room for visible tracing independently of native reasoning
+        # configuration.
         initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, True,
+            request.model or backend.default_model, extended=True,
         )
 
         def call(max_new_tokens: int):
@@ -79,7 +79,6 @@ class ConfidenceStrategy(Strategy):
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_new_tokens=max_new_tokens,
-                think=think,
             )
 
         psink: dict = {}

@@ -1,13 +1,9 @@
 """
 VirtualRuntime — the central orchestrator for AI Computing.
 
-Wires together a backend (how to talk to the LLM), a strategy (how to
-turn a spec into an answer), and validation (type-checking + constraints).
-Implements the operational semantics from the paper (rule E-AI):
-
-    e ⇓ v    ⟨σ, d, v⟩ ⇓ r
-    ─────────────────────────
-         (σ, d)(e) ⇓ r
+Coordinates a backend for model inference, a strategy for predicting outputs
+from specifications and inputs, and type and constraint validation.
+Also manages execution retries, result caching, and tracing.
 """
 
 from __future__ import annotations
@@ -19,18 +15,23 @@ from typing import Any, Dict, List, Optional
 
 from .backends import Backend, create_backend
 from .cache import ResultCache
-from .parsing import coerce_type
+from .parsing import ParseOutcome, coerce_type
 from .request import ExecuteRequest, ExecuteResult, FailureType
 from .strategies import Strategy, create_strategy
 from .strategies.base import CallStats, _accumulate
 from .trace import Tracer
-from .types import ParsedSignature, parse_signature
+from .types import (
+    ParsedSignature,
+    UnsupportedAnnotationError,
+    parse_signature,
+    validate_type_annotation,
+)
 from .validation import (
     ValidationMode,
-    AIConstraintError,
     AITypeError,
     validate_constraints,
     validate_inputs,
+    validate_media_inputs,
     validate_output,
 )
 
@@ -39,7 +40,7 @@ logger = logging.getLogger("aicomputing")
 
 class VirtualRuntime:
     """
-    LLM-as-runtime facade.
+    Predict function outputs from specifications and concrete inputs.
 
     Example::
 
@@ -50,7 +51,7 @@ class VirtualRuntime:
             inputs={"x": 2, "y": 3},
             return_type=int,
         ))
-        assert result.result == 5
+        print(result.result)  # Expected answer: 5; predictions may be incorrect.
     """
 
     def __init__(
@@ -59,20 +60,22 @@ class VirtualRuntime:
         model: Optional[str] = None,
         strategy: str | Strategy = "direct",
         strict_types: bool = True,
-        validation_mode: "ValidationMode | str | bool | None" = None,
+        validation_mode: ValidationMode | str | bool | None = None,
         cache_size: int = 2048,
         trace_file: Optional[str] = None,
         **backend_kwargs,
     ) -> None:
         # Set up backend
         if isinstance(backend, str):
-            bk_kwargs = dict(backend_kwargs)
             if model:
-                bk_kwargs["model"] = model
-            self._backend = create_backend(backend, **bk_kwargs)
+                backend_kwargs["model"] = model
+            self._backend = create_backend(backend, **backend_kwargs)
         else:
             self._backend = backend
 
+        # Named strategies have known configuration; custom instances may
+        # depend on external state that cannot safely be represented in a key.
+        self._cache_default_strategy = isinstance(strategy, str)
         # Set up strategy
         if isinstance(strategy, str):
             self._strategy = create_strategy(strategy)
@@ -81,11 +84,8 @@ class VirtualRuntime:
 
         self._strict_types = strict_types
 
-        # Default structural-validation policy for calls that do not override
-        # it. WARN preserves the permissive behaviour library and CLI callers
-        # already had; the experiment constructs the runtime with STRICT.
-        # strict_types is honoured when validation_mode is not given, so the
-        # older keyword keeps working.
+        # Default output-validation policy; requests can override it.
+        # None selects WARN independently of the input strict_types setting.
         self._validation_mode = ValidationMode.coerce(
             validation_mode,
             ValidationMode.WARN,
@@ -94,7 +94,7 @@ class VirtualRuntime:
         self._cache = ResultCache(maxsize=cache_size)
         self._tracer = Tracer(trace_file) if trace_file else None
 
-        # Keep model name for reporting
+        # Default model for requests that do not specify one.
         self._model = model or self._backend.default_model
 
     @property
@@ -123,58 +123,134 @@ class VirtualRuntime:
 
     def execute(self, req: ExecuteRequest) -> ExecuteResult:
         """
-        Execute an AI function call.
+        Predict a function output from its specification and concrete inputs.
 
-        Implements the E-AI evaluation rule:
-        1. Parse and validate the signature + inputs  (T-AI type checking)
-        2. Check the cache
-        3. Run the strategy to get a predicted result
-        4. Validate the output type and constraints
-        5. Retry if validation fails (up to max_retries)
-        6. Cache and return
+        Checks inputs and returns a cached result when available. Otherwise,
+        runs the strategy, coerces and validates its output, and may retry
+        after validation failures. Caches eligible results and optionally
+        records a trace before returning.
+
+        Strict input-validation errors and backend exceptions may propagate.
+        A returned prediction is not guaranteed to be correct.
         """
         t0 = time.monotonic()
+        req.validate_limits()
+
+        # Capability restrictions apply under both input-validation policies.
+        validate_media_inputs(req.inputs)
 
         model = req.model or self._model
         strat_name = req.strategy or self._strategy.name
-        strict = req.strict_types if req.strict_types is not None else self._strict_types
+        input_strict = (
+            req.strict_types
+            if req.strict_types is not None
+            else self._strict_types
+        )
 
-        # --- Step 1: Parse signature and validate inputs (T-AI) ---
-        # In non-strict mode validate_inputs reports rather than raises, so
-        # these warnings are the only signal that the caller supplied a
-        # malformed task. Every benchmark runs non-strict, so they are
-        # carried onto the result and into the trace rather than discarded.
+        # Parse the signature and validate inputs.
+        # Permissive input checking records warnings on the result and trace.
         parsed_sig: Optional[ParsedSignature] = None
         input_warnings: List[str] = []
         try:
             parsed_sig = parse_signature(req.signature)
-            input_warnings = validate_inputs(parsed_sig, req.inputs, strict=strict)
+            input_warnings = validate_inputs(
+                parsed_sig,
+                req.inputs,
+                strict=input_strict,
+            )
+        except UnsupportedAnnotationError:
+            # Unsupported specifications are errors under either input policy.
+            raise
         except (ValueError, AITypeError) as e:
             logger.warning("Input validation: %s", e)
-            if strict:
+            if input_strict:
                 raise
             input_warnings = [str(e)]
 
-        # --- Step 2: Cache lookup ---
-        cached = self._cache.get(
-            req.signature, req.docstring, req.inputs, model, strat_name,
-            think=req.think, temperature=req.temperature,
-            top_p=req.top_p, max_new_tokens=req.max_new_tokens,
+        # Resolve execution requirements before cache lookup. A cache hit must
+        # not bypass output-policy validation or changed output requirements.
+        strategy = (
+            create_strategy(strat_name)
+            if strat_name != self._strategy.name
+            else self._strategy
         )
+        output_policy = (
+            req.validation_mode
+            if req.validation_mode is not None
+            else req.strict_types
+        )
+        mode = ValidationMode.coerce(output_policy, self._validation_mode)
+        output_strict = mode is ValidationMode.STRICT
+        return_type = req.return_type
+        if return_type is None and parsed_sig is not None:
+            return_type = parsed_sig.return_type
+
+        validate_type_annotation(return_type)
+
+        # Arbitrary predicates cannot be identified safely from their names
+        # or mutable closure state, so constrained requests always run fresh.
+        named_strategy = (
+            strat_name != self._strategy.name or self._cache_default_strategy
+        )
+        backend_state = self._backend.cache_state() if named_strategy else None
+        cache_allowed = (
+            named_strategy
+            and backend_state is not None
+            and not req.constraints
+            and not input_warnings
+            and parsed_sig is not None
+        )
+        cache_context = {
+            "backend_class": (
+                type(self._backend).__module__,
+                type(self._backend).__qualname__,
+            ),
+            "backend_state": backend_state,
+            "validation_mode": mode.value,
+            "return_type": return_type,
+            "max_retries": req.max_retries,
+            "strategy_class": (
+                type(strategy).__module__,
+                type(strategy).__qualname__,
+            ),
+            "strategy_state": (
+                strategy.cache_state() if named_strategy else None
+            ),
+        }
+        cached = None
+        if cache_allowed:
+            cached = self._cache.get(
+                req.signature,
+                req.docstring,
+                req.inputs,
+                model,
+                strat_name,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_new_tokens=req.max_new_tokens,
+                context=cache_context,
+            )
         if cached is not None:
-            # Return a copy so callers can't mutate the cached entry.
+            # The cache returns an isolated snapshot. Call records, usage and
+            # retry counts describe this hit.
             hit = replace(
                 cached,
                 cached=True,
                 input_warnings=input_warnings,
+                retries=0,
+                token_retries=0,
+                tokens_used=0,
+                token_budget_used=None,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                model_calls=0,
+                reasoning_requests=[],
+                reasoning_observations=[],
                 latency_ms=(time.monotonic() - t0) * 1000,
             )
-            # Trace the hit as well. This path used to return before reaching
-            # the tracer, so `cached` was only ever written as False and the
-            # trace could not report a hit rate. tokens_used is reported as 0
-            # because this invocation made no model call — the tokens the
-            # answer originally cost are on the earlier uncached line, so a
-            # naive sum over the trace stays correct.
+
+            # Record cache hits too; they consume no new inference tokens.
             if self._tracer:
                 self._tracer.log(
                     signature=req.signature,
@@ -186,12 +262,12 @@ class VirtualRuntime:
                     strategy=strat_name,
                     latency_ms=hit.latency_ms,
                     tokens_used=0,
-                    # The ceiling the original call requested, carried over
-                    # from the cached result: this invocation requested none.
+                    # This invocation requested no generation budget.
                     token_budget_used=hit.token_budget_used,
                     cached=True,
                     retries=hit.retries,
-                    think=req.think,
+                    reasoning_requests=hit.reasoning_requests,
+                    reasoning_observations=hit.reasoning_observations,
                     substrategy=hit.substrategy,
                     revised=hit.revised,
                     pre_revision_value=hit.pre_revision_value,
@@ -204,138 +280,116 @@ class VirtualRuntime:
                 )
             return hit
 
-        # --- Step 3: Execute strategy (with retries) ---
-        strategy = (
-            create_strategy(strat_name) if strat_name != self._strategy.name
-            else self._strategy
-        )
-
-        last_error: Optional[str] = None
+        # Initialise validation-retry state.
         retries = 0
         feedback: Optional[Dict[str, Any]] = None
 
-        # Resolved before the loop because coercion depends on it: STRICT
-        # applies only meaning-preserving conversions, so the policy has to be
-        # known while the value is being coerced, not merely afterwards.
-        mode = ValidationMode.coerce(
-            req.validation_mode,
-            ValidationMode.coerce(req.strict_types, self._validation_mode),
-        )
-        strict = mode is ValidationMode.STRICT
-
-        # Usage accumulated across EVERY attempt of this invocation.
-        #
-        # CallStats is created per strategy.execute(), so a validation retry
-        # started a fresh one and the calls made by earlier attempts vanished
-        # from the totals: a two-call strategy that was retried once reported
-        # model_calls=2 when four calls had really been made and billed. The
-        # reliability-vs-compute comparison depends on this number, and the
-        # arms most likely to be retried are the ones whose cost is already
-        # highest, so the error ran in the direction that flattered them.
+        # Accumulate reported usage across all strategy attempts.
         total_stats = CallStats()
 
-        # The strategy's parser coerces before the runtime validates, so it
-        # must see the same policy. Without this the parser resolved WARN from
-        # a request that carried no explicit mode and repaired 3.7 into 3;
-        # STRICT then validated the repaired value and passed it, defeating
-        # the whole point of the strict condition.
-        effective_req = replace(req, validation_mode=mode)
+        # Pass resolved settings to generation, parsing, and answer selection.
+        effective_req = replace(
+            req, model=model, validation_mode=mode, return_type=return_type,
+        )
 
-        for attempt in range(1 + max(0, req.max_retries)):
-            strat_result = strategy.execute(effective_req, self._backend,
-                                            feedback=feedback)
+        for attempt in range(1 + req.max_retries):
+            strat_result = strategy.execute(
+                effective_req,
+                self._backend,
+                feedback=feedback,
+            )
             _accumulate(total_stats, strat_result.call_stats)
 
-            # --- Step 4: Coerce + Validate output ---
+            execution_failure = {
+                "truncated": FailureType.GENERATED_CODE_TRUNCATED,
+                "syntax_error": FailureType.GENERATED_CODE_SYNTAX,
+                "runtime_error": FailureType.GENERATED_CODE_RUNTIME,
+                "timeout": FailureType.GENERATED_CODE_TIMEOUT,
+            }.get(strat_result.exec_status)
+
+            # Capture missing results before permissive coercion. A failed
+            # execution is not a successful return of None.
+            parse_failed = (
+                execution_failure is not None
+                or (
+                    strat_result.exec_status is None
+                    and strat_result.value is None
+                    and strat_result.parse_status not in (
+                        ParseOutcome.PARSED,
+                        ParseOutcome.FALLBACK,
+                    )
+                )
+            )
+
+            # Each attempt starts with fresh output warnings.
             type_warnings: List[str] = []
             constraint_warnings: List[str] = []
 
-            # Determine the expected return type
-            return_type = req.return_type
-            if return_type is None and parsed_sig:
-                return_type = parsed_sig.return_type
-
-            # Coerce the result to match the expected type (e.g. list → tuple).
-            # Under STRICT only conversions that preserve meaning are applied,
-            # so the runtime cannot repair 3.7 into 3 and then report that the
-            # model returned a structurally valid int.
+            # Apply the same limited conversions under WARN and STRICT.
             if return_type is not None:
                 strat_result.value = coerce_type(
-                    strat_result.value, return_type, strict=strict)
-
-            # Type check (T-AI: result has type T_out)
-            if return_type is not None:
-                try:
-                    type_warnings = validate_output(
-                        strat_result.value, return_type, strict=False,
-                    )
-                except AITypeError as e:
-                    type_warnings = [str(e)]
-
-            # Constraint check
-            if req.constraints:
-                try:
-                    constraint_warnings = validate_constraints(
-                        strat_result.value, req.constraints, strict=False,
-                    )
-                except AIConstraintError as e:
-                    constraint_warnings = [str(e)]
-
-            # If validation passes (or we're out of retries), accept
-            if not type_warnings and not constraint_warnings:
-                break
-
-            # Don't retry on token exhaustion — same budget will produce
-            # the same empty result. Detect by: empty raw_text + high token count.
-            if not strat_result.raw_text and strat_result.tokens_used:
-                logger.info(
-                    "Skipping retry: token budget exhausted (%d tokens used, "
-                    "response was empty — model spent all tokens on thinking)",
-                    strat_result.tokens_used,
+                    strat_result.value,
+                    return_type,
+                    strict=output_strict,
                 )
+
+            # Collect failures before deciding whether to retry or withhold.
+            if return_type is not None:
+                type_warnings = validate_output(
+                    strat_result.value,
+                    return_type,
+                    strict=False,
+                )
+
+            if req.constraints and not parse_failed and not type_warnings:
+                constraint_warnings = validate_constraints(
+                    strat_result.value,
+                    req.constraints,
+                    strict=False,
+                )
+
+            # Retry failed recovery as well as type and constraint failures.
+            if not parse_failed and not type_warnings and not constraint_warnings:
                 break
 
             if attempt < req.max_retries:
-                last_error = "; ".join(type_warnings + constraint_warnings)
+                errors = type_warnings + constraint_warnings
+                if parse_failed:
+                    errors.insert(
+                        0,
+                        strat_result.parse_error
+                        or "Could not recover an output value from the model response.",
+                    )
+                last_error = "; ".join(errors)
                 feedback = {
                     "raw_output": strat_result.raw_text,
                     "error": last_error,
                 }
                 retries += 1
-                logger.info("Retry %d/%d: %s", retries, req.max_retries, last_error)
+                logger.info(
+                    "Validation retry %d/%d: %s",
+                    retries,
+                    req.max_retries,
+                    last_error,
+                )
 
         latency = (time.monotonic() - t0) * 1000
 
-        # --- Step 4b: apply the validation policy -------------------------
-        #
-        # The loop above deliberately collects warnings instead of raising, so
-        # that a failed check can drive a retry. Once retries are exhausted the
-        # policy decides what those warnings MEAN.
-        #
-        # Previously this step did not exist: validate_output was called with
-        # strict=False unconditionally, so a value already known to violate the
-        # declared return type was returned as a successful invocation and the
-        # warning was the only trace. `strict_types=True` changed nothing about
-        # output handling. Under STRICT the invalid value is now withheld --
-        # the runtime does not hand back an object it has just determined does
-        # not satisfy the contract.
-        #
-        # The failure is reported, not raised. Raising would abort the caller's
-        # whole run over one bad example, which is the failure mode
-        # bench_args.execute_resilient exists to prevent; a marked row lets the
-        # cell finish and stay countable.
+        # Apply output policy after the retry loop ends.
+        # STRICT withholds outputs that fail type or constraint validation.
+        # WARN returns those outputs with diagnostics.
         validation_status = "valid"
         failure_type: Optional[str] = None
-        final_value = strat_result.value
+        final_value = None if parse_failed else strat_result.value
 
-        if type_warnings:
+        # Recovery failure takes precedence over incidental validation errors.
+        # A successfully parsed None is instead checked against its output type.
+        if parse_failed:
+            validation_status = "unparsed"
+        elif type_warnings:
             validation_status = "invalid_type"
         elif constraint_warnings:
             validation_status = "invalid_constraint"
-        elif final_value is None and strat_result.exec_status is None:
-            # Nothing was recoverable from the model's text. Distinct from a
-            # wrong answer: the specification was never executed.
-            validation_status = "unparsed"
 
         if validation_status != "valid":
             failure_type = {
@@ -343,10 +397,14 @@ class VirtualRuntime:
                 "invalid_constraint": FailureType.CONSTRAINT_VALIDATION,
                 "unparsed": FailureType.PARSE,
             }[validation_status]
+            if execution_failure is not None:
+                failure_type = execution_failure
+
             if mode is ValidationMode.STRICT and validation_status != "unparsed":
                 logger.info(
                     "STRICT validation: withholding %s output (%s)",
-                    validation_status, "; ".join(type_warnings + constraint_warnings),
+                    validation_status,
+                    "; ".join(type_warnings + constraint_warnings),
                 )
                 final_value = None
 
@@ -370,33 +428,43 @@ class VirtualRuntime:
             token_retries=strat_result.retries,
             tokens_used=strat_result.tokens_used,
             token_budget_used=strat_result.token_budget_used,
-            # Cost accounting summed over every call the strategy made. Left
-            # as None when the strategy did not report any (e.g. a result
-            # built outside generate_with_retry), never defaulted to 0.
-            # Accumulated across every attempt, not just the last one.
-            input_tokens=total_stats.input_tokens,
-            output_tokens=total_stats.output_tokens,
+            # Expose a component total only when every recorded call supplied it.
+            input_tokens=(
+                total_stats.input_tokens if total_stats.input_complete else None
+            ),
+            output_tokens=(
+                total_stats.output_tokens if total_stats.output_complete else None
+            ),
             total_tokens=total_stats.total_tokens,
             model_calls=total_stats.model_calls,
             parse_status=strat_result.parse_status,
             parse_error=strat_result.parse_error,
-            requested_think=total_stats.requested_think,
-            effective_think=total_stats.effective_think,
-            thinking_honoured=total_stats.thinking_honoured,
+            reasoning_requests=total_stats.reasoning_requests,
+            reasoning_observations=total_stats.reasoning_observations,
             latency_ms=latency,
         )
 
-        # --- Step 5: Cache (successful results only) ---
-        # Caching parse failures or invalid outputs would poison every
-        # future call with the same arguments.
-        if not type_warnings and not constraint_warnings and strat_result.value is not None:
+        # Cache only valid predictions from eligible requests. ExecuteResult
+        # distinguishes a cached None prediction from a missing cache entry.
+        if (
+            cache_allowed
+            and validation_status == "valid"
+            and result.exec_status in (None, "ok")
+        ):
             self._cache.put(
-                req.signature, req.docstring, req.inputs, model, strat_name, result,
-                think=req.think, temperature=req.temperature,
-                top_p=req.top_p, max_new_tokens=req.max_new_tokens,
+                req.signature,
+                req.docstring,
+                req.inputs,
+                model,
+                strat_name,
+                result,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_new_tokens=req.max_new_tokens,
+                context=cache_context,
             )
 
-        # --- Step 6: Trace ---
+        # Record the uncached invocation.
         if self._tracer:
             self._tracer.log(
                 signature=req.signature,
@@ -411,7 +479,8 @@ class VirtualRuntime:
                 token_budget_used=strat_result.token_budget_used,
                 cached=False,
                 retries=retries,
-                think=req.think,
+                reasoning_requests=result.reasoning_requests,
+                reasoning_observations=result.reasoning_observations,
                 substrategy=strat_result.substrategy,
                 revised=strat_result.revised,
                 pre_revision_value=strat_result.pre_revision_value,

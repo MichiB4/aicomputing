@@ -1,39 +1,30 @@
 #!/usr/bin/env python3
 """
-Aggregate per-example benchmark CSVs into the long format make_tables.py reads.
+Aggregate per-example benchmark CSVs into one row per experiment cell.
 
-Why this exists
----------------
-The oracle scripts write one row per *example* (400 rows for a 400-problem
-run). make_tables.py expects one row per *cell*:
+The manifest runner and legacy oracle scripts write per-example rows.
+This script groups them by (model, benchmark, strategy) for analysis:
 
     model,benchmark,strategy,n,correct,accuracy
-    qwen3:4b-instruct,humaneval,direct,164,71,0.4329
 
-Nothing bridged the two, so make_tables produced empty tables from a directory
-full of real results. This script is that bridge: group by
-(model, benchmark, strategy), count, divide.
+Capability accuracy uses scorable invocations. Attempted counts and
+infrastructure failures are reported separately.
 
-It also emits the derived columns the §6.3/§6.4/§6.5 generators need, all
-computed from data the oracles already record — no extra model calls:
-
-    exec_ok, exec_error, exec_timeout   code-generation baseline only (§5.5/§6.3)
-    revised, flip_to_correct,           contract only (§6.4)
-      flip_to_incorrect
-    type_warned                         any arm (§6.5)
+Additional columns include:
+    exec_ok, exec_error, exec_timeout, exec_truncated   generated-code outcomes
+    n_checked, n_revised, revision_rate,
+      flip_to_correct, flip_to_incorrect               contract checks
+    type_warned, type_adherence                       output validation
 
 Usage
 -----
-    python scripts/aggregate_results.py --raw results/eval_raw \\
-                                        --out results/aggregated/summary.csv
-    python scripts/make_tables.py --results results/aggregated --out paper/tables
+    python scripts/aggregate_results.py --raw aicomputing/results/pilot-v3 \\
+                                        --out results/aggregated/pilot-v3.csv
 
 Scoping
 -------
---raw takes ONE directory, deliberately. Pointing a glob at results/ swept up
-every stale exploratory CSV and silently averaged them into the reported
-numbers. Aggregating a specific run's directory into a separate output
-directory keeps what reaches the paper decidable by looking at a path.
+--raw takes one directory. Select one experiment run's result directory
+and write the aggregate to a separate output directory.
 """
 
 from __future__ import annotations
@@ -46,10 +37,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# The module docstring below is reused as argparse's --help text and
-# contains non-ASCII (em dashes, section marks). Windows consoles often
-# default to a codepage that cannot encode those, which makes --help
-# crash. Force UTF-8, as the runner scripts already do.
+# Use UTF-8 for CLI output, matching the runner scripts.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
@@ -173,29 +161,21 @@ def aggregate(rows: list[dict]) -> list[dict]:
         # --- §5.5 / §6.3: code-generation baseline execution outcomes -------
         # "error" is the pre-taxonomy status; syntax_error/runtime_error
         # replaced it. Both are counted so historical cells still aggregate.
-        statuses = [str(r.get("exec_status", "")).strip() for r in group]
+        statuses = [str(r.get("exec_status", "")).strip() for r in scorable_rows]
         exec_ok = sum(1 for s in statuses if s == "ok")
         exec_syntax = sum(1 for s in statuses if s == "syntax_error")
         exec_runtime = sum(1 for s in statuses if s in ("runtime_error", "error"))
         exec_timeout = sum(1 for s in statuses if s == "timeout")
+        exec_truncated = sum(1 for s in statuses if s == "truncated")
         exec_error = exec_syntax + exec_runtime
         has_exec = any(s for s in statuses)
 
         # --- §6.4: contract revision and flip rates -------------------------
-        # `revised` is None/blank for arms with no revision step, which is
-        # different from False (had one, kept the original). Only rows that
-        # actually ran a revision step are counted, so the denominator is the
-        # number of checked examples rather than the whole cell.
-        # The result schema writes contract_checked / contract_revised. This
-        # read the legacy `revised` column, which the current writer does not
-        # emit, so every contract statistic silently came out as zero on
-        # post-refactor rows -- a null result that looked like "the check never
-        # fires" rather than like a broken reader.
-        #
-        # `contract_checked` is explicit: a check that ran and kept its answer
-        # is different from an arm that has no check at all, and inferring the
-        # distinction from whether a revision field is non-empty conflates
-        # them. Legacy rows without the column fall back to `revised`.
+        # The result schema records contract_checked and contract_revised.
+        # A check that keeps its answer differs from an arm without a check.
+        # Revision statistics use scorable rows where a check ran.
+        # Older rows use revised: None/blank means unchecked, while False
+        # means a check ran and kept its answer.
         def _checked(r):
             explicit = r.get("contract_checked")
             if not is_blank(explicit):
@@ -208,7 +188,7 @@ def aggregate(rows: list[dict]) -> list[dict]:
                 value = r.get("revised")
             return truthy(value)
 
-        checked = [r for r in group if _checked(r)]
+        checked = [r for r in scorable_rows if _checked(r)]
         n_revised = sum(1 for r in checked if _revised(r))
         flip_to_correct = flip_to_incorrect = 0
         for r in checked:
@@ -224,12 +204,10 @@ def aggregate(rows: list[dict]) -> list[dict]:
                 flip_to_correct += 1
 
         # --- §6.5: type adherence -------------------------------------------
-        # A non-empty type_warnings list means the value did not inhabit the
-        # declared return type. Counted separately from correctness, which is
-        # scored on value: a well-typed wrong answer and a wrongly-typed one
-        # both score 0, and only this column tells them apart.
+        # Type warnings are counted independently of semantic correctness.
+        # Under WARN, a returned value can be correct and still carry warnings.
         type_warned = 0
-        for r in group:
+        for r in scorable_rows:
             raw = r.get("type_warnings")
             if is_blank(raw):
                 continue
@@ -269,8 +247,9 @@ def aggregate(rows: list[dict]) -> list[dict]:
             "exec_syntax_error": exec_syntax if has_exec else "",
             "exec_runtime_error": exec_runtime if has_exec else "",
             "exec_timeout": exec_timeout if has_exec else "",
+            "exec_truncated": exec_truncated if has_exec else "",
             "exec_failure_rate": (
-                round((exec_error + exec_timeout) / n, 6) if has_exec and n else ""
+                round((exec_error + exec_timeout + exec_truncated) / n, 6) if has_exec and n else ""
             ),
         }
         out.append(row)
@@ -286,6 +265,7 @@ COLUMNS = [
     "flip_to_correct", "flip_to_incorrect",
     "exec_syntax_error", "exec_runtime_error",
     "exec_ok", "exec_error", "exec_timeout", "exec_failure_rate",
+    "exec_truncated",
 ]
 
 

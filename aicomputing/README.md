@@ -56,22 +56,22 @@ git clone https://github.com/MichiB4/aicomputing.git
 cd aicomputing
 
 # Core package (Ollama backend)
-pip install -e .
+pip install -e "./aicomputing"
 
 # Local Hugging Face inference
-pip install -e ".[hf]"
+pip install -e "./aicomputing[hf]"
 
 # OpenAI-compatible APIs
-pip install -e ".[openai]"
+pip install -e "./aicomputing[openai]"
 
 # Benchmark dependencies (HumanEval+, MBPP+, GSM8K, BBH)
-pip install -e ".[benchmarks]"
+pip install -e "./aicomputing[benchmarks]"
 
 # Test dependencies
-pip install -e ".[test]"
+pip install -e "./aicomputing[test]"
 
 # Typical research/development install
-pip install -e ".[hf,openai,benchmarks,test]"
+pip install -e "./aicomputing[hf,openai,benchmarks,test]"
 ```
 
 ### Ollama
@@ -90,6 +90,20 @@ The `hf` backend runs `transformers` models locally. A CUDA-capable GPU is stron
 ### OpenAI-compatible APIs
 
 The `openai` backend works with services exposing a compatible chat-completions API, including hosted providers and local servers such as vLLM or LM Studio. Provider credentials should be supplied through the environment or CLI and must **not** be committed to manifests.
+
+### System certificates for benchmark commands
+
+The benchmark runners, manifest builder, and MBPP ground-truth builder configure
+system certificates at command startup when the optional `truststore` package is
+installed. The verifier does so only with `--check-datasets`; its default checks
+remain offline. Importing these modules or `bench_args` does not change SSL
+configuration.
+
+If `truststore` is absent, Python's normal HTTPS configuration is retained.
+Errors importing an installed package or configuring its certificates propagate
+so a broken setup is visible. Applications embedding these helpers can call
+`bench_args.configure_system_certificates()` explicitly at startup, before
+importing HTTPS clients. The core prediction package does not configure SSL.
 
 ---
 
@@ -196,9 +210,8 @@ The stable core of a request is:
 | `strategy` | Optional per-call strategy override |
 | `model` | Optional per-call model override |
 | `temperature`, `top_p` | Generation controls |
-| `max_new_tokens` | Optional token-budget override |
+| `max_new_tokens` | Optional starting allowance; truncation retries may increase it |
 | `max_retries` | Maximum validation retries |
-| `think` | Optional explicit thinking-mode override |
 | `validation_mode` | `"warn"` or `"strict"` structural-validation policy |
 
 The legacy `strict_types` option remains supported for compatibility; `validation_mode` is the clearer interface for output-validation policy.
@@ -216,8 +229,8 @@ The legacy `strict_types` option remains supported for compatibility; `validatio
 | `validation_status` | `valid`, `invalid_type`, `invalid_constraint`, or `unparsed` |
 | `failure_type` | Structured reason for an execution failure, if any |
 | `scorable` | Whether the outcome represents model behaviour rather than infrastructure failure |
-| `requested_think` / `effective_think` | Requested vs. realizable model reasoning mode |
-| `thinking_honoured` | Whether the model family could honor the requested mode |
+| `reasoning_requests` | Ordered native override records per returned response; not proof of model compliance |
+| `reasoning_observations` | Ordered response measurements, recorded separately from requested settings |
 | `input_tokens`, `output_tokens`, `total_tokens` | Provider-reported token usage when available |
 | `model_calls` | Total model calls consumed by the invocation |
 | `retries`, `token_retries` | Validation and token-budget retries |
@@ -248,11 +261,11 @@ All primary strategies receive the same underlying information: function signatu
 
 ### `direct`
 
-The minimal execution condition. The model is asked for the return value without requiring an explicit procedure or trace. Unless overridden, Direct requests `think=False`.
+The minimal execution condition. The model is asked for the return value without requiring an explicit procedure or trace. Direct does not enable or disable native reasoning.
 
 ### `cot`
 
-Requests an explicit state-oriented reasoning trace before the final value. Unless overridden, the strategy requests `think=True`.
+Requests an explicit state-oriented reasoning trace before the final value. The trace instruction does not configure native reasoning.
 
 ### `pseudocode`
 
@@ -270,7 +283,7 @@ Implements **execute -> check -> revise**:
 2. present that candidate back to the model as unverified;
 3. accept it or return a replacement.
 
-By default the prediction stage requests `think=False` and the checking stage requests `think=True`. The initial and final values are retained so beneficial and harmful revisions can be measured separately.
+Both stages use the same configured backend-native reasoning settings. Their default starting allowances remain 512 and 8192 tokens, with preserved model-specific budget rules for prediction. The initial and final values are retained so beneficial and harmful revisions can be measured separately.
 
 Contract checking is **model-based semantic self-checking**, not formal verification.
 
@@ -336,17 +349,76 @@ runtime = VirtualRuntime(
 
 The backend normalizes provider responses, token usage, and finish reasons. Provider-side tool use is treated as contamination of the specification-only execution condition and is rejected rather than silently scored as model reasoning.
 
-### Thinking-mode resolution
+### Explicit native reasoning settings
 
-Model families differ in whether reasoning can be enabled or disabled. `model_config.resolve_thinking()` is the single place where a strategy's requested mode is reconciled with the model family's capability.
+Prompting strategy and native reasoning configuration are independent. The
+package does not infer support, activation or successful disabling from model
+names. Configure only the native option understood by the selected backend:
 
-The runtime records:
+| Backend | Runtime constructor option | CLI option |
+|---|---|---|
+| OpenAI-compatible | `reasoning_effort="<value>"` | `--reasoning-effort VALUE` |
+| Ollama | `think=False`, `True`, or a level string | `--ollama-think false`, `true`, or `VALUE` |
+| HuggingFace | `enable_thinking=False` or `True` | `--no-hf-thinking` or `--hf-thinking` |
 
-```text
-requested_think -> effective_think -> thinking_honoured
+Omitting an option sends no override. Explicit unsupported settings surface as
+errors; they are not silently removed or retried without the setting. Whether
+a provider/model honors a setting requires separate verification.
+
+
+All adapters expose the same capability API, independently of model names:
+
+```python
+from aicomputing.backends import create_backend
+
+backend = create_backend("ollama", model="<model-id>", host="http://127.0.0.1:11434")
+capabilities = backend.reasoning_capabilities(discover=True)
+native_options = backend.reasoning_options(False, capabilities=capabilities)
+# Pass native_options into a new backend/runtime constructor for this same model/endpoint.
 ```
 
-This matters experimentally. For example, a model that always reasons cannot realize a genuinely non-thinking Direct condition; the result metadata makes that mismatch explicit rather than silently treating the conditions as equivalent.
+A capability record identifies its backend, model, native parameter, endpoint,
+source, accepted values and advertised default. Its kind is unknown, unsupported,
+toggle, fixed, levels or choices. These describe accepted controls, not verified
+internal behavior. A singleton value means one accepted setting.
+
+Discovery is explicit. Without discover=True it performs no metadata requests.
+Ollama reads raw /api/show JSON with a finite timeout, preserving fields older
+SDK response models discard. An omitted thinking object leaves support unknown; malformed controls raise. HF does
+not load a tokenizer/model for discovery; a loaded tokenizer without a chat
+template makes this adapter's template control unavailable. Other HF cases and
+generic OpenAI-compatible endpoints remain unknown unless usable controls are
+supplied as a ReasoningCapabilities declaration. Declarations are labelled
+user_declared and are not provider verification.
+
+reasoning_options returns native constructor keywords without changing the
+backend. It checks value types and model/endpoint scope. None returns no override.
+Unknown support requires allow_unknown=True for an experimental request; this
+cannot bypass known unavailable controls or unsupported values. Native strings
+are preserved literally; low is not interpreted as off.
+
+Existing native constructor/CLI options remain unverified passthroughs. This
+additive API does not yet enforce discovery in those existing execution paths
+or qualify a model's observed thinking behavior.
+
+`ExecuteResult.reasoning_requests` preserves one entry for each returned model
+response, in order: `{}` means no native override was sent, and `None` means
+the backend did not record it. A cache hit has `[]` because it made no new model
+call. These records do not include failed internal SDK attempts and do not
+prove the model's internal reasoning behavior.
+
+`reasoning_observations` records Ollama's thinking-field type and character
+count, and whether the original content contains opening or closing `<think>`
+tags. Observations are captured before text cleanup and preserve returned-call
+order through retries, traces, and canonical result CSVs. Other backends report
+`None` per response until they implement observation recording. Cache hits have
+`[]`. These measurements do not infer an actual mode or certify compliance;
+ordinary CoT text can be requested independently of native thinking.
+
+`ExecuteRequest.think`, the inferred result fields and universal CLI
+`--think`/`--no-think` flags are removed. Starting-budget selection remains
+separate: `get_token_budget(model, extended=...)` preserves existing numeric
+allowances without configuring native controls.
 
 ---
 
@@ -372,7 +444,7 @@ The runtime keeps three concepts separate:
 
 `WARN` mode preserves permissive library behaviour and returns structurally problematic values with diagnostics.
 
-`STRICT` mode applies only meaning-preserving coercions. After retries are exhausted, a known-invalid value is withheld and reported as an execution failure rather than returned as a successful result. The runtime does **not** claim that a structurally valid value is semantically correct.
+Both modes use the same limited conversions; neither truncates a fractional float to an integer. Under `STRICT`, after retries are exhausted, a known-invalid value is withheld and reported as an execution failure rather than returned as a successful result. The runtime does **not** claim that a structurally valid value is semantically correct.
 
 ### Two retry mechanisms
 
@@ -387,9 +459,9 @@ Token usage and model-call counts accumulate across all calls and retries.
 
 ## Caching and tracing
 
-`VirtualRuntime` includes an in-memory LRU cache. The cache key includes the specification, inputs, model, strategy, thinking request, and relevant generation settings, so experimentally different invocations do not silently share results.
+`VirtualRuntime` includes an in-memory LRU cache. The cache key includes the specification, inputs, model, strategy, relevant generation settings, backend class and declared backend configuration (including native reasoning overrides). A backend must explicitly supply a cache state; unknown custom backends bypass caching by default. Credentials are excluded from that state, so this is not an account- or environment-isolation guarantee.
 
-Optional JSONL tracing records the observable execution path, including request data, prompts, raw responses, result metadata, retries, and provider information.
+Optional JSONL tracing records request and result metadata, including the ordered `reasoning_requests`. Prompt/raw-text fields describe the strategy result; they are not a complete history of every internal call or retry.
 
 ```python
 runtime = VirtualRuntime(
@@ -436,7 +508,7 @@ The experiment is deliberately separated from the core runtime. Benchmark adapte
 
 | Benchmark | Group | Main `n` | Role |
 |---|---|---:|---|
-| HumanEval+ | core | 158 | specification execution on programming functions |
+| HumanEval+ | core | 157 | specification execution on programming functions |
 | MBPP+ | core | 200 | specification execution on programming functions |
 | GSM8K | generalization | 200 | numerical reasoning through the same runtime interface |
 | BBH-5 | generalization | 200 | symbolic/logical reasoning through the same runtime interface |
@@ -445,12 +517,13 @@ The benchmark groups are reported separately; the experiment does **not** constr
 
 ### HumanEval+
 
-- 158 of 164 tasks expose usable precomputed expected outputs without executing a reference implementation during evaluation.
+- 158 of 164 tasks expose precomputed expected outputs without executing a reference implementation during evaluation.
+- 157 of those tasks have signatures supported by the runtime. `HumanEval/12` uses `Optional[str]` and is ineligible.
 - One invocation is selected per function.
 - Invocation selection draws from the combined base + plus input pool.
 - Worked `>>>` doctest examples are stripped from the public docstring for the experiment so the target value is not partially demonstrated in the specification.
 
-The frozen main selection contains 153 plus-pool and 5 base-pool invocations.
+The frozen main selection contains 152 plus-pool and 5 base-pool invocations.
 
 ### MBPP+
 
@@ -458,17 +531,54 @@ MBPP+ does not publish expected outputs for its augmented `plus_input` cases. To
 
 `scripts/build_mbpp_ground_truth.py` executes the official canonical solution once per task in an isolated preprocessing process and stores only the invocation inputs, expected outputs, pool labels, and provenance. The canonical implementation itself is not serialized into the artifact and is never available to the runtime under evaluation.
 
-Current preprocessing statistics:
+Current preprocessing statistics (cache format 3, `typed-v1`):
 
 - 378 source tasks;
-- 345 tasks with at least one successfully resolved canonical invocation;
-- 1,040 resolved base inputs;
-- 35,633 resolved plus inputs;
-- 374 tasks usable by the final adapter after combining frozen augmented outputs with available base cases.
+- 362 tasks with at least one successfully resolved canonical invocation;
+- 1,120 resolved base inputs;
+- 37,992 resolved plus inputs;
+- 375 tasks usable by the final adapter after combining frozen augmented outputs with available base cases.
 
-The main experiment selects 200 MBPP+ functions, with 172 plus-pool and 28 base-pool invocations.
+The main experiment selects 200 MBPP+ functions, with 184 plus-pool and 16 base-pool invocations.
 
 Because the original MBPP prompt does not contain a Python signature, the adapter reads the **function interface only** from the reference solution's `def` line. The implementation body is not shown to the evaluated model.
+
+#### Restore the frozen cache
+
+The published artifact is `data/mbpp_plus_ground_truth.json.gz`.
+`data/mbpp_plus_ground_truth.sha256` records SHA-256 checksums for both the
+archive and the extracted JSON. The benchmark loader reads the extracted
+`data/mbpp_plus_ground_truth.json`; restore it before dataset verification or
+experiment runs.
+
+From the repository root, run this PowerShell block:
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$hashes = @{}
+Get-Content -LiteralPath 'data/mbpp_plus_ground_truth.sha256' | ForEach-Object {
+    $hash, $name = $_ -split '\s+', 2
+    $hashes[$name] = $hash
+}
+$archive = 'data/mbpp_plus_ground_truth.json.gz'
+$cache = 'data/mbpp_plus_ground_truth.json'
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $hashes['mbpp_plus_ground_truth.json.gz']) {
+    throw 'Compressed MBPP cache checksum mismatch'
+}
+if (-not (Test-Path -LiteralPath $cache)) {
+    python -m gzip -d $archive
+    if ($LASTEXITCODE -ne 0) { throw 'MBPP cache extraction failed' }
+}
+if ((Get-FileHash -LiteralPath $cache -Algorithm SHA256).Hash -ne $hashes['mbpp_plus_ground_truth.json']) {
+    throw 'Extracted MBPP cache checksum mismatch'
+}
+```
+
+An existing JSON cache is verified and reused. A checksum mismatch raises an
+error without replacing an existing file. Extraction retains the gzip archive.
+Version the gzip and checksum files; keep the extracted JSON and obsolete
+`mbpp_plus_ground_truth.v1.backup.json` local. Rebuilding ground truth is a
+separate preprocessing operation and can change the frozen observations.
 
 ### GSM8K
 
@@ -516,6 +626,58 @@ The baseline receives the same signature and behavioural specification as the sp
 
 Generated programs are compiled and executed in a restricted sandbox. Syntax errors, runtime errors, timeouts, and invalid outputs are recorded separately and remain scorable model outcomes.
 
+Each generated program uses one shared namespace, so its functions can access
+sibling helpers, recursive definitions, constants and import aliases. The existing
+restricted builtins and allowed modules remain available.
+Standard built-in exception classes are available for `raise` and `try/except`.
+Other builtin and import restrictions remain in effect.
+Allowed absolute imports use Python's standard importer, so nonexistent
+submodules raise normal import errors. Relative imports are rejected because
+the generated program has no package context.
+Helper class definitions and custom exceptions are supported, including ordinary
+`object` inheritance. The namespace has a stable `__name__` for class metadata.
+`callable`, `bytes` and `getattr` are also available. Returning custom class
+instances remains subject to the result-transfer restrictions described below.
+Source extraction removes surrounding code fences without cutting at main-guard
+text. A normal `if __name__ == "__main__":` block remains inactive in the named
+worker namespace; its source is still parsed, so syntax errors remain failures.
+The baseline validates its declared Python function header before model generation
+and uses Python's normalized function name. Invalid headers fail immediately;
+this check does not execute default expressions or change the general oracle's
+signature-parsing policy.
+
+The baseline starts with 512 output tokens unless an explicit positive starting
+allowance is supplied. A token-limited response triggers up to five additional
+calls, doubling the allowance each time and recording usage from every response.
+After six truncated responses, the partial code is not executed; the outcome is
+`generated_code_truncated` with `exec_status="truncated"`, a scorable failure.
+A genuine successful return of `None` remains distinct from this missing result.
+
+Runtime validation retries are separate. When validation triggers another attempt,
+the baseline includes the previous generated response and validation error and
+requests corrected Python code for the original specification. Syntax errors, runtime
+errors and execution timeouts also use this retry allowance, even for return types
+that permit `None`. Exhausted execution failures remain unsuccessful and scorable;
+a successful execution returning `None` is validated normally. Benchmark expected
+answers are not supplied as feedback. With the default one validation retry,
+repeated exhaustion can use two attempts of six backend calls each. Internal SDK
+HTTP retries are separate from these counts. The generated-code process timeout
+remains 10 seconds and does not limit model generation time. Aggregated summaries
+append `exec_truncated` and include those failures in `exec_failure_rate`.
+
+`CodeGenBaseline(timeout=...)` accepts positive, finite Python integers or floats
+in seconds and normalizes them to a float. Invalid settings are rejected during
+construction: this includes booleans, strings, `None`, zero, negative values,
+non-finite numbers and integers too large to convert to a finite float.
+
+Worker environment setup, process startup and result-transfer failures propagate
+instead of triggering code-correction retries. The benchmark wrapper records
+these as `harness_error` and excludes them from accuracy. An unexplained worker
+exit is handled the same way. This includes results that cannot be serialized
+for transfer; the runtime does not label transfer failures as program exceptions.
+An explicit worker program-error report remains a scorable generated-code failure.
+
+
 ---
 
 ## Reproducible experiment manifests
@@ -528,18 +690,24 @@ The manifest records, among other fields:
 - seed (`42` for the current protocol);
 - benchmark item and invocation IDs;
 - base/plus pool labels;
-- dataset revisions and content fingerprints;
+- available dataset revision metadata and selected-content fingerprints;
 - validation mode;
 - primary strategies;
 - generation settings;
-- strategy thinking policy;
-- model IDs, providers, and model-specific limits once the run is finalized.
+- explicit per-model native reasoning overrides (or no override);
+- model IDs and resolved provider/backend/URL settings once the run is finalized.
 
-Content fingerprints are recomputed when a run starts. Dataset drift is treated as an error rather than silently evaluating different content under the same item ID.
+Default manifest construction requires every selected item to resolve and receive a content fingerprint. At run time, missing fingerprints, missing or unexpected items, duplicate IDs and changed selected content are errors before model execution. The direct benchmark runner's explicit `--allow-content-drift` debug override permits continuation with warnings; those runs must not be reported as reproductions. The experiment orchestrator does not expose this override.
+
+Pool fingerprints compare the collection of item IDs. They do not establish that the contents or ordering behind positional IDs are unchanged; selected-content verification provides that separate check. Dataset revision metadata describes what the loader exposes, not a verified source commit. HumanEval+ and MBPP+ currently record that metadata as unknown because their loaders return items without source metadata.
+
+Rebuilding with matching selection inputs and rules reproduces the selection, not necessarily the complete manifest bytes: the creation timestamp changes, for example. Reusing a manifest also does not guarantee identical model outputs.
 
 ### Template manifests vs. frozen run manifests
 
-The shipped `pilot-v2.json` and `main-v1.json` define the benchmark selection but intentionally leave `models` / `model_configs` empty until the final provider/model choices are verified.
+Current code requires integer manifest schema version **2** and selection compatibility version **4**. Selection compatibility also covers content-fingerprint encoding, so schema version 2 alone is insufficient. Manifests with earlier selection versions must be rebuilt; reproduce historical runs with their corresponding code revision.
+
+Historical `pilot-v2.json` and `main-v1.json` use the old schema. Current pilot/main presets use experiment IDs `pilot-v3` / `main-v2`; those names do not establish compatibility. Generate compatible manifests explicitly. Historical files are not automatically converted.
 
 For a reportable run, create a model configuration file such as:
 
@@ -547,11 +715,13 @@ For a reportable run, create a model configuration file such as:
 {
   "model/id-a": {
     "provider": "groq",
-    "max_new_tokens": 4096
+    "max_new_tokens": 4096,
+    "reasoning": {}
   },
   "model/id-b": {
     "provider": "cerebras",
-    "max_new_tokens": 8192
+    "max_new_tokens": 8192,
+    "reasoning": {}
   }
 }
 ```
@@ -564,10 +734,10 @@ Then build a frozen manifest from the workspace root:
 python scripts/make_manifest.py \
   --preset pilot \
   --model-configs model_configs.json \
-  --out manifests/pilot-v2-run.json
+  --out manifests/pilot-v3-run.json
 ```
 
-The runner refuses an unfrozen model configuration for a reportable run. Provider information is taken from the manifest, and a contradictory CLI provider is rejected.
+The runner refuses an unfrozen model configuration for a reportable run. Provider/backend/URL and native settings are taken from the manifest; contradictory CLI settings are rejected. `reasoning: {}` records no override. Experiment temperature is fixed to 0.0; starting token allowances and validation retry counts are validated separately. API keys remain CLI/environment settings and must not be frozen into the manifest.
 
 ---
 
@@ -579,24 +749,24 @@ The following commands assume the workspace layout containing `aicomputing/`, `s
 
 ```bash
 python scripts/verify_experiment.py \
-  --manifest manifests/pilot-v2-run.json
+  --manifest manifests/pilot-v3-run.json
 ```
 
-This checks the experiment plumbing without making provider calls.
+This checks synthetic plumbing and manifest metadata without dataset loads or provider calls. To also resolve real datasets, verify recorded content and rebuild selections, add `--check-datasets`; that mode may download data. Synthetic success alone does not verify the real dataset or model behavior.
 
 ### 2. Inspect the run plan
 
 ```bash
 python scripts/run_experiment.py \
-  --manifest manifests/pilot-v2-run.json \
+  --manifest manifests/pilot-v3-run.json \
   --dry-run
 ```
 
-### 3. Run pilot-v2
+### 3. Run pilot-v3
 
 ```bash
 python scripts/run_experiment.py \
-  --manifest manifests/pilot-v2-run.json
+  --manifest manifests/pilot-v3-run.json
 ```
 
 
@@ -620,17 +790,18 @@ Scorable failures include model-attributable outcomes such as:
 
 Infrastructure failures such as provider errors, provider-side timeouts, or harness failures are reported separately and excluded from the capability denominator. A rate limit must not look like a model-capability failure.
 
-The shared benchmark result schema also records full cost information and Contract revision metadata, enabling paired Direct-vs-enhanced comparisons and reliability-vs-cost analysis.
+The shared benchmark result schema also records available token and model-call accounting and Contract revision metadata, enabling paired Direct-vs-enhanced comparisons and reliability-vs-cost analysis.
 
 ---
 
 ## Result aggregation
 
-Experiment results are written to the experiment-specific results directory and can be processed with the shared analysis scripts:
+Experiment results are written to the experiment-specific results directory. Summarize the pilot run from the workspace root:
 
 ```bash
-python scripts/aggregate_results.py ...
-python scripts/make_tables.py ...
+python scripts/aggregate_results.py \
+  --raw aicomputing/results/pilot-v3 \
+  --out results/aggregated/pilot-v3.csv
 ```
 
 The result format supports:
@@ -654,15 +825,15 @@ From the workspace root:
 pytest
 ```
 
-The test suite covers the core runtime, parsing and validation, strategy behaviour, thinking-mode propagation, cost accounting, benchmark selection, manifests, EvalPlus adaptation, failure classification, and integration paths.
+The test suite covers the core runtime, parsing and validation, strategy behaviour, explicit native-setting propagation, cost accounting, benchmark selection, manifests, EvalPlus adaptation, failure classification, and integration paths.
 
 The experiment also has an offline consistency verifier:
 
 ```bash
-python scripts/verify_experiment.py --manifest manifests/pilot-v2.json
+python scripts/verify_experiment.py
 ```
 
-No provider calls are required for this verification step.
+This default uses synthetic fixtures and no dataset/provider calls. `--manifest PATH` additionally inspects current-version metadata; `--manifest PATH --check-datasets` opts into real dataset checks, which may download data but still use fake model responses.
 
 ---
 
@@ -675,13 +846,15 @@ workspace/
 ├── aicomputing/                 # installable Python package
 │   ├── src/aicomputing/         # runtime implementation
 │   ├── benchmarks/              # adapters + unified benchmark runner
-│   ├── tests/                   # package/experiment tests
 │   ├── pyproject.toml
 │   └── README.md
+├── tests/                       # package/experiment tests
 ├── scripts/                     # manifest, experiment, analysis scripts
 ├── manifests/                   # frozen benchmark selections
 ├── data/
-    └── mbpp_plus_ground_truth.json
+    ├── mbpp_plus_ground_truth.json.gz
+    ├── mbpp_plus_ground_truth.sha256
+    └── mbpp_plus_ground_truth.json  # extracted locally
 
 ```
 

@@ -1,34 +1,21 @@
-"""
-Pseudocode-then-simulate strategy.
+"""Predict outputs by requesting a procedure followed by its simulation.
 
-The model writes the procedure the docstring describes as numbered plain-English
-steps, then simulates that procedure on the concrete inputs and reports what it
-produced.
+The prompt asks the model to describe a procedure as numbered plain-English
+steps, simulate those steps on the concrete inputs, and return the predicted
+answer in a result object. No interpreter executes the generated procedure.
 
-Why this is not `cot`. SCoT traces execution directly from the specification,
-so nothing in the prompt stops the model from settling on a plausible-looking
-answer first and narrating a trace that agrees with it — the failure mode CoRE
-(Gao et al., 2026) documents as *superficial execution*, where output accuracy
-far exceeds the fidelity of the intermediate states claimed along the way. Here
-the procedure is committed in stage 1 and the value is whatever stage 2 gets by
-executing it, which makes the two stages separately inspectable in the trace.
+Both stages are requested in one completion. The strategy does not freeze
+the procedure separately or verify that the simulation follows it.
+The response text retains both stages when the model includes them.
 
-Why this is not the baseline. The procedure is deliberately non-executable: the
-prompt asks for plain English and forbids language syntax. Adapted from the
-pseudocode-simulation path of DuET (Han et al., 2026), whose other path compiles
-real code and runs it in a real interpreter. That second path is what
-`benchmarks/baselines/code_gen_baseline.py` measures and is explicitly not AI
-computing — the moment an interpreter produces the value, the model has stopped
-being the runtime.
+Native reasoning is configured by the backend rather than selected by
+this strategy. The requested procedure and simulation are prompt instructions.
+The initial output-token budget comes from get_token_budget unless
+request.max_new_tokens supplies one.
 
-Single call. Both stages are produced in one completion, which keeps the cost
-comparable to `cot` and keeps the strategy a single consultation of the oracle,
-matching the shape of the E-AI evaluation rule.
-
-Token budget: resolves think=True unless the request says otherwise, so
-get_token_budget() returns 8192 — two stages need more room than one. Passing
-think=False on the request drops a non-thinking model to 512; a request-level
-max_new_tokens overrides both.
+Token-limit retries can make up to five additional calls, doubling the
+budget without a package-level cap. The runtime may also repeat the strategy
+after parsing or validation failures, according to request.max_retries.
 """
 
 from __future__ import annotations
@@ -37,15 +24,20 @@ from typing import Optional
 
 from ..backends.base import Backend
 from ..model_config import get_token_budget
-from ..parsing import parse_result
 from ..prompting import build_pseudocode_prompt, build_retry_prompt
 from ..request import ExecuteRequest
-from .base import (CallStats, Strategy, StrategyResult,
-                   generate_with_retry, make_parser, _is_strict)
+from .base import (
+    CallStats,
+    Strategy,
+    StrategyResult,
+    _is_strict,
+    generate_with_retry,
+    make_parser,
+)
 
 
 class PseudocodeStrategy(Strategy):
-    """Commit to a plain-English procedure, then simulate it on the inputs."""
+    """Request a plain-English procedure and its simulation on the inputs."""
 
     def __init__(self, include_fewshot: bool = True) -> None:
         self._include_fewshot = include_fewshot
@@ -73,9 +65,9 @@ class PseudocodeStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        think = request.think if request.think is not None else True
+        # Preserve the existing default allowance; this does not set native reasoning.
         initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, think,
+            request.model or backend.default_model, extended=True,
         )
 
         def call(max_new_tokens: int):
@@ -85,7 +77,6 @@ class PseudocodeStrategy(Strategy):
                 temperature=request.temperature,
                 top_p=request.top_p,
                 max_new_tokens=max_new_tokens,
-                think=think,
             )
 
         psink: dict = {}

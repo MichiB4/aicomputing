@@ -40,19 +40,29 @@ For a smaller installation, select only the extras you need.
 
 ## Experiment setup
 
-Verify the frozen experiment definition without making model API calls:
+Run synthetic plumbing checks without loading datasets or making model API calls:
 
 ```bash
-python scripts/verify_experiment.py --manifest manifests/pilot-v2.json
+python scripts/verify_experiment.py
 ```
 
-Run an experiment from a finalized manifest:
+Current manifests require integer schema version **2** and selection compatibility version **4**, using the `pilot-v3` / `main-v2` experiment presets. Preset names alone do not establish compatibility. Earlier manifests must be rebuilt, or used with their corresponding historical code; they are not automatically converted. See the package README for model configuration and manifest creation.
+
+Inspect a newly generated manifest without loading datasets: 
 
 ```bash
-python scripts/run_experiment.py --manifest manifests/pilot-v2-run.json
+python scripts/verify_experiment.py --manifest manifests/pilot-v3-run.json
 ```
 
-The committed manifests define the benchmark samples and experimental configuration. Model/provider configurations for a reported run are frozen separately before execution.
+Add `--check-datasets` to resolve real items and rebuild selections; that mode may download data, but still makes no real model calls.
+
+Run an experiment from a finalized current-version manifest:
+
+```bash
+python scripts/run_experiment.py --manifest manifests/pilot-v3-run.json
+```
+
+New reported-run manifests freeze benchmark selections, generation settings, provider/backend/URL identity and explicit native reasoning overrides before execution. Credentials remain outside the manifest.
 
 ## Status
 

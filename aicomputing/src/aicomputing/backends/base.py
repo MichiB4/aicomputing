@@ -14,25 +14,27 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from ..model_config import DEFAULT_MAX_NEW_TOKENS, DEFAULT_THINK
+from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from .reasoning import ReasoningCapabilities
 
 logger = logging.getLogger("aicomputing")
 
 
+class BackendCommunicationError(RuntimeError):
+    """A provider API or transport failed; the original error is the cause."""
+
+
+class BackendTimeoutError(BackendCommunicationError):
+    """A provider API request timed out."""
+
+
 class ToolUseDetected(RuntimeError):
-    """
-    The provider ran a tool (typically a code interpreter) on our behalf.
+    """A response contains tool-use indicators and was rejected.
 
-    This invalidates the measurement rather than degrading it. The thesis's
-    claim is that the model predicts a function's output by reasoning from the
-    specification alone; if an interpreter produced the value, the number
-    measures the interpreter. No strategy in this package ever declares tools,
-    so this can only arise from a provider-side default — which is exactly the
-    case that would otherwise pass unnoticed, because a tool call returns
-    `content=None` and reads downstream as an ordinary parse failure.
+    The indicators may describe a requested call rather than an executed tool.
+    They do not establish how the response's answer was produced.
 
-    Raised rather than logged deliberately: a crashed run is recoverable, a
-    silently contaminated results table defended at a viva is not.
+    This exception distinguishes the guard's rejection from a parsing failure.
     """
 
 
@@ -53,13 +55,9 @@ class GenerateResponse:
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
 
-    # What the strategy asked for vs. what the model family actually does.
-    # Populated from model_config.resolve_thinking(). None on backends that do
-    # not model thinking. See ThinkingResolution for why the distinction is an
-    # experimental confound and not a detail.
-    requested_think: Optional[bool] = None
-    effective_think: Optional[bool] = None
-    thinking_honoured: Optional[bool] = None
+    # Native reasoning overrides sent for this call, not proof of their effect.
+    # {} means no override was sent; None means the backend did not record it.
+    requested_reasoning: Optional[Dict[str, Any]] = None
     finish_reason: Optional[str] = None   # "stop" | "length" | None
     raw: Optional[Dict[str, Any]] = None  # backend-specific metadata
 
@@ -70,6 +68,10 @@ class GenerateResponse:
     # in a run of thousands. Recording it per call makes a post-hoc audit
     # possible from stored traces instead of only at call time.
     provider_finish_reason: Optional[str] = None
+
+    # Response measurements before text cleanup, not an inferred native mode.
+    # None means this backend did not record observations.
+    observed_reasoning: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +200,9 @@ def normalize_finish_reason(value: Optional[str], model: str = "") -> str:
     # Collapse camelCase ("maxTokens" -> "maxtokens") for the alias lookup.
     flat = key.replace("_", "")
 
-    if key in _LENGTH_ALIASES or flat in _LENGTH_ALIASES:
+    if any(flat == alias.replace("_", "") for alias in _LENGTH_ALIASES):
         return "length"
-    if key in _STOP_ALIASES or flat in _STOP_ALIASES:
+    if any(flat == alias.replace("_", "") for alias in _STOP_ALIASES):
         return "stop"
 
     logger.warning(
@@ -225,6 +227,68 @@ class Backend(ABC):
     def default_model(self) -> str:
         """Default model name when none is specified."""
 
+    # Native names and transport types; no model-name classifications.
+    reasoning_parameter: Optional[str] = None
+    _reasoning_value_types: tuple[type, ...] = ()
+
+    def _reasoning_endpoint(self) -> Optional[str]:
+        return None
+
+    def reasoning_capabilities(
+        self, model: Optional[str] = None, *, discover: bool = False,
+    ) -> ReasoningCapabilities:
+        """Return controls without inference; subclasses may discover metadata."""
+        if type(discover) is not bool:
+            raise TypeError("discover must be a bool")
+        selected = self.default_model if model is None else model
+        return ReasoningCapabilities(
+            backend=self.name, model=selected, parameter=self.reasoning_parameter,
+            endpoint=self._reasoning_endpoint(),
+            support="unknown" if self.reasoning_parameter else "unsupported",
+            source="unavailable",
+        )
+
+    def reasoning_options(
+        self, value: bool | str | None, *, model: Optional[str] = None,
+        capabilities: Optional[ReasoningCapabilities] = None,
+        discover: bool = False, allow_unknown: bool = False,
+    ) -> Dict[str, Any]:
+        """Build validated constructor options; do not change this backend."""
+        if type(discover) is not bool or type(allow_unknown) is not bool:
+            raise TypeError("discover and allow_unknown must be bools")
+        if value is None:
+            return {}
+        if type(value) not in self._reasoning_value_types:
+            raise TypeError("Value has the wrong type for this adapter's native control")
+        ReasoningCapabilities._check_value(value)
+        local = self.reasoning_capabilities(model, discover=False)
+        if local.support == "unsupported":
+            local.validate(value)
+        if capabilities is not None and discover:
+            raise ValueError("Pass capabilities or request discovery, not both")
+        if capabilities is None:
+            capabilities = self.reasoning_capabilities(model, discover=True) if discover else local
+        if not isinstance(capabilities, ReasoningCapabilities):
+            raise TypeError("capabilities must be ReasoningCapabilities")
+        if (
+            capabilities.backend, capabilities.model,
+            capabilities.parameter, capabilities.endpoint,
+        ) != (local.backend, local.model, local.parameter, local.endpoint):
+            raise ValueError("Capabilities belong to a different adapter, model or endpoint")
+        if any(type(item) not in self._reasoning_value_types for item in capabilities.values):
+            raise TypeError("Advertised values cannot be sent by this adapter")
+        capabilities.validate(value, allow_unknown=allow_unknown)
+        return {self.reasoning_parameter: value}
+
+    def cache_state(self) -> Optional[Dict[str, Any]]:
+        """Return non-secret generation configuration, or None to bypass caching.
+
+        An implementation must include settings that can affect generation
+        or response acceptance. The runtime adds backend class identity and
+        the request's model and generation parameters separately.
+        """
+        return None
+
     @abstractmethod
     def generate(
         self,
@@ -235,18 +299,24 @@ class Backend(ABC):
         top_p: float = 1.0,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
-        think: bool = DEFAULT_THINK,
         **kwargs,
     ) -> GenerateResponse:
         """
         Send a prompt and return the generated text.
 
+        Raise BackendCommunicationError for provider API/transport failures
+        and BackendTimeoutError for request timeouts. Keep local setup and
+        response-processing errors distinct. Custom backends use this same
+        contract so benchmark classification does not guess from messages.
+
         Implementations must return a GenerateResponse whose finish_reason is
         already normalised to "stop" or "length" (see normalize_finish_reason);
         the strategy layer tests for "length" exactly.
 
-        Defaults for max_new_tokens and think come from model_config so that
-        every backend behaves identically when a caller omits them.
+        The default initial token allowance comes from model_config.
+        Native reasoning settings belong to backend configuration rather
+        than this per-call interface. Implementations must reject unsupported
+        keyword arguments, including the removed per-call think argument.
         """
 
     def generate_chat(
@@ -257,13 +327,17 @@ class Backend(ABC):
         temperature: float = 0.0,
         top_p: float = 1.0,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-        think: bool = DEFAULT_THINK,
         **kwargs,
     ) -> GenerateResponse:
         """
         Chat-style generation (system + user messages).
         Default implementation concatenates into a single prompt.
         """
+        if "think" in kwargs:
+            raise TypeError(
+                "The per-call 'think' argument is no longer supported; "
+                "configure native reasoning on the backend."
+            )
         prompt = "\n\n".join(msg.get("content", "") for msg in messages)
         return self.generate(
             prompt,
@@ -271,7 +345,6 @@ class Backend(ABC):
             temperature=temperature,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
-            think=think,
             **kwargs,
         )
 

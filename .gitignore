@@ -47,3 +47,7 @@ Thumbs.db
 
 # Local re-root backup files
 pre-reroot-*
+
+# Extracted and obsolete MBPP caches; publish gzip and checksum
+data/mbpp_plus_ground_truth.json
+data/mbpp_plus_ground_truth.v1.backup.json

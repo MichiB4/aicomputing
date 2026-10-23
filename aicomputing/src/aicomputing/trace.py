@@ -1,33 +1,45 @@
 """
 Tracing module for AI Computing.
 
-Records every VirtualRuntime.execute() invocation to a JSONL file for
-debugging and analysis. Each line is a self-contained JSON object with the
-full request, raw model output, parsed result, and diagnostics.
+Appends runtime-submitted records to a JSONL file for debugging and analysis.
+Serialization and file errors produce warnings without interrupting predictions.
+Each line contains request details, recorded response text, a recovered value,
+and selected diagnostics.
 
-Note this logs invocations, not solely LLM calls: a cache hit is recorded
-too, with "cached": true. Consumers must therefore filter on that field when
-counting model calls or summing cost. To keep a naive sum honest, a cached
-line reports tokens_used = 0 — that invocation consumed no tokens, and the
-tokens the answer originally cost appear on the earlier uncached line.
+Cache hits are recorded with "cached": true and tokens_used set to zero.
+Records describe invocations, not individual model calls. Reasoning-request
+records preserve the native settings reported for responses in call order;
+they do not establish the provider's actual reasoning mode. Uncached token
+counts currently use the legacy strategy-reported value and may exclude
+usage from earlier attempts.
 
 Usage:
-    vr = VirtualRuntime(backend="ollama", model="qwen3:4b", trace_file="trace.jsonl")
-    # ... execute calls ...
-    # trace.jsonl now contains one JSON line per execute() call
+    from aicomputing import VirtualRuntime
+
+    vr = VirtualRuntime(
+        backend="ollama",
+        model="qwen3:4b",
+        trace_file="trace.jsonl",
+    )
+    # Execute requests through vr.
+    # trace.jsonl receives records when the runtime calls the tracer.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+logger = logging.getLogger("aicomputing")
+
+
 class Tracer:
-    """Appends one JSON line per call to a JSONL file."""
+    """Append JSONL records; warn if serialization or writing fails."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -48,7 +60,7 @@ class Tracer:
         token_budget_used: Optional[int] = None,
         cached: bool = False,
         retries: int = 0,
-        think: Optional[bool] = None,
+        reasoning_requests: Optional[List[Optional[Dict[str, Any]]]] = None,
         substrategy: Optional[str] = None,
         revised: Optional[bool] = None,
         pre_revision_value: Any = None,
@@ -58,57 +70,66 @@ class Tracer:
         input_warnings: Optional[List[str]] = None,
         type_warnings: Optional[List[str]] = None,
         constraint_warnings: Optional[List[str]] = None,
+        reasoning_observations: Optional[List[Optional[Dict[str, Any]]]] = None,
     ) -> None:
-        self._call_count += 1
-
-        entry = {
-            "call_id": self._call_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "signature": signature,
-            "docstring": docstring,
-            "inputs": _safe_serialize(inputs),
-            "raw_text": raw_text,
-            "parsed_result": _safe_serialize(parsed_result),
-            "parsed_type": type(parsed_result).__name__,
-            "model": model,
-            "strategy": strategy,
-            "substrategy": substrategy,
-            "revised": revised,
-            "pre_revision_value": _safe_serialize(pre_revision_value),
-            "provider_finish_reason": provider_finish_reason,
-            "exec_status": exec_status,
-            # The prompts actually sent. The trace previously recorded the
-            # model's output but never its input, so a stored run could not
-            # be audited for what was asked.
-            "prompts": prompts or [],
-            "think": think,
-            "latency_ms": round(latency_ms, 1),
-            "tokens_used": tokens_used,
-            # The ceiling requested, against which tokens_used is the actual
-            # consumption. Recorded because it is not recoverable from
-            # retries alone: the starting budget varies with thinking mode
-            # and can be overridden per request, and the doubling is capped.
-            "token_budget_used": token_budget_used,
-            "cached": cached,
-            "retries": retries,
-            "input_warnings": input_warnings or [],
-            "type_warnings": type_warnings or [],
-            "constraint_warnings": constraint_warnings or [],
-        }
-
-        line = json.dumps(entry, ensure_ascii=False, default=str)
-
+        # Protect record numbering and writing through this tracer instance.
         with self._lock:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            self._call_count += 1
+
+            try:
+                entry = {
+                    "call_id": self._call_count,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "signature": signature,
+                    "docstring": docstring,
+                    "inputs": _safe_serialize(inputs),
+                    "raw_text": raw_text,
+                    "parsed_result": _safe_serialize(parsed_result),
+                    "parsed_type": type(parsed_result).__name__,
+                    "model": model,
+                    "strategy": strategy,
+                    "substrategy": substrategy,
+                    "revised": revised,
+                    "pre_revision_value": _safe_serialize(pre_revision_value),
+                    "provider_finish_reason": provider_finish_reason,
+                    "exec_status": exec_status,
+                    # Strategy-recorded prompts supplied by the runtime.
+                    "prompts": prompts or [],
+                    "reasoning_requests": _safe_serialize(reasoning_requests),
+                    "reasoning_observations": _safe_serialize(reasoning_observations),
+                    "latency_ms": round(latency_ms, 1),
+                    # Legacy strategy-reported token count.
+                    "tokens_used": tokens_used,
+                    # Strategy-reported output-token ceiling, not tokens consumed.
+                    "token_budget_used": token_budget_used,
+                    "cached": cached,
+                    "retries": retries,
+                    "input_warnings": input_warnings or [],
+                    "type_warnings": type_warnings or [],
+                    "constraint_warnings": constraint_warnings or [],
+                }
+
+                line = json.dumps(entry, ensure_ascii=False, default=str)
+
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                # Optional diagnostics must not prevent returning a prediction.
+                logger.warning(
+                    "Could not record trace to %s",
+                    self.path,
+                    exc_info=True,
+                )
 
     @property
     def call_count(self) -> int:
-        return self._call_count
+        """Number of log attempts, including failed serialization or writes."""
+        with self._lock:
+            return self._call_count
 
 
 def _safe_serialize(obj: Any) -> Any:
-    """Convert an object to something JSON-serializable."""
+    """Convert values to diagnostic representations for JSON encoding."""
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, (list, tuple)):

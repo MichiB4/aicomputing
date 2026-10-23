@@ -29,8 +29,8 @@ openai = ["openai>=1.30"]
 benchmarks = ["human-eval", "evalplus>=0.3", "datasets>=2.0", "tqdm",
               "truststore>=0.8", "openpyxl>=3.1"]
 dev = ["pytest>=8", "pytest-cov"]
-# The test suite imports the benchmark adapters, so a dev-only install
-# cannot collect it. Kept explicit rather than implied.
+# Core plus dev dependencies support collection of the current test suite.
+# The test extra also includes benchmark-related dependencies.
 test = ["pytest>=8", "pytest-cov", "evalplus>=0.3", "datasets>=2.0",
         "human-eval", "tqdm", "truststore>=0.8"]
 

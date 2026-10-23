@@ -1,10 +1,9 @@
 """
 Unified benchmark runner: one manifest cell (model x benchmark x strategy).
 
-Replaces the four bespoke `*_oracle.py` main() functions for the revised
-experiment. Those remain in the tree as the graders they always were -- this
-module imports their scoring functions -- and as the entry points that
-reproduce the historical pilot results, which must stay runnable.
+Runs manifest-defined experiments using the graders from the legacy oracle
+modules. Their ad-hoc entry points remain available. Historical pilot results
+require the corresponding code revision and manifest.
 
 What changed relative to running an oracle directly:
 
@@ -22,21 +21,29 @@ What changed relative to running an oracle directly:
 
 Usage:
     python benchmarks/run_benchmark.py --benchmark gsm8k \\
-        --manifest manifests/pilot-v2.json \\
+        --manifest manifests/pilot-v3.json \\
         --provider groq --model qwen/qwen3.8-27b --strategy direct \\
-        --out results/experiment/pilot-v2_gsm8k_direct.csv
+        --out results/experiment/pilot-v3_gsm8k_direct.csv
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import sys
 
 from bench_args import (  # adjusts sys.path first
     add_common_args, resolve_args, build_runtime, execute_resilient,
+    configure_system_certificates,
 )
+
+# Configure application HTTPS before importing clients; grader imports stay inert.
+if __name__ == "__main__":
+    configure_system_certificates()
+
 from aicomputing import ExecuteRequest
 from aicomputing.request import FailureType
+from aicomputing.validation import ValidationMode
 
 from adapters import get_adapter
 from experiment import (
@@ -45,6 +52,9 @@ from experiment import (
     BENCHMARK_GROUP,
     check_pools,
     load_manifest,
+    resolve_reasoning_settings,
+    resolve_model_connection,
+    resolve_generation_settings,
     verify_content,
 )
 from result_schema import build_row, new_run_id, write_results
@@ -75,10 +85,62 @@ def main() -> int:
                          "manifest's. Off by default: once a manifest exists "
                          "it is authoritative, so a run cannot silently "
                          "disagree with the configuration it records.")
+    ap.add_argument(
+        "--allow-unfrozen-model-config", action="store_true",
+        help="Debug only: allow a model absent from model_configs; not reproducible.",
+    )
     args = ap.parse_args()
-    cfg = resolve_args(args)
-
+    if args.limit is not None and args.limit < 0:
+        ap.error("--limit must be non-negative")
     manifest = load_manifest(args.manifest)
+    model_configs = manifest.get("model_configs", {})
+    if not isinstance(model_configs, dict):
+        raise ValueError("model_configs must be an object keyed by model ID")
+    if args.model is None:
+        models = manifest.get("models") or []
+        if len(models) != 1:
+            ap.error("--model is required unless the manifest names exactly one model")
+        args.model = models[0]
+    if args.model not in model_configs:
+        if not args.allow_unfrozen_model_config:
+            ap.error("Model has no frozen configuration; use the debug flag explicitly")
+        model_cfg = {}
+        print("WARNING: unfrozen model configuration; this is a debug run")
+    else:
+        model_cfg = model_configs[args.model]
+        connection = resolve_model_connection(model_cfg)
+        for field, value in connection.items():
+            supplied = getattr(args, field)
+            if supplied is not None and supplied != value:
+                raise ValueError(f"CLI {field} conflicts with the manifest")
+            setattr(args, field, value)
+    cfg = resolve_args(args)
+    cli_reasoning = {
+        key: cfg.backend_kwargs[key]
+        for key in ("reasoning_effort", "think", "enable_thinking")
+        if key in cfg.backend_kwargs
+    }
+    reasoning = resolve_reasoning_settings(
+        cfg.backend, model_cfg.get("reasoning", {}), cli_reasoning,
+    )
+    cfg.backend_kwargs.update(reasoning)
+    print(f"Reasoning overrides from manifest (used for this run): {reasoning}")
+    resolved_gen = resolve_generation_settings(manifest.get("generation", {}), model_cfg)
+    if cfg.max_tokens is not None:
+        if cfg.max_tokens <= 0:
+            raise ValueError("--max-tokens must be positive")
+        if not args.override_generation and cfg.max_tokens != resolved_gen["max_new_tokens"]:
+            raise ValueError(
+                "--max-tokens conflicts with the manifest; use --override-generation "
+                "for an explicit debug override"
+            )
+    if args.override_generation:
+        print("NOTE: --override-generation set; CLI values take precedence "
+              "over the manifest and this run is not manifest-reproducible.",
+              file=sys.stderr)
+        if cfg.max_tokens is not None:
+            resolved_gen["max_new_tokens"] = cfg.max_tokens
+
     benchmark = args.benchmark
 
     # The baseline answers "would generating an implementation have done
@@ -112,36 +174,14 @@ def main() -> int:
         print(f"WARNING: {len(problems)} item(s) no longer match the manifest; "
               f"results are NOT reproducible. First: {problems[0]}", file=sys.stderr)
 
-    if args.limit:
+    if args.limit is not None:
         items = items[: args.limit]
-
-    # The manifest is authoritative for everything that defines the
-    # experimental condition. Previously it recorded these and the runner
-    # then used its own defaults, so a manifest could state temperature=0.0
-    # while the run used something else and the row would record neither.
-    gen = dict(manifest.get("generation") or {})
-    # Per-model overrides from the manifest win over the global block. This is
-    # where a model's token cap belongs: recorded with the experiment, not in
-    # a runner-side table that can change the run without changing the
-    # manifest.
-    model_cfg = (manifest.get("model_configs") or {}).get(cfg.model, {})
-    gen.update({k: v for k, v in model_cfg.items()
-                if k in ("temperature", "top_p", "max_retries", "max_new_tokens")})
-    if args.override_generation:
-        print("NOTE: --override-generation set; CLI values take precedence "
-              "over the manifest and this run is not manifest-reproducible.",
-              file=sys.stderr)
-        if cfg.max_tokens:
-            gen["max_new_tokens"] = cfg.max_tokens
-    resolved_gen = {
-        "temperature": gen.get("temperature", 0.0),
-        "top_p": gen.get("top_p", 1.0),
-        "max_retries": gen.get("max_retries", 1),
-        "max_new_tokens": gen.get("max_new_tokens", cfg.max_tokens),
-    }
 
     strategy_name = BASELINE_NAME if cfg.baseline else cfg.strategy
     vr = build_runtime(cfg)
+    output_mode = ValidationMode.coerce(
+        manifest.get("validation_mode"), vr.validation_mode,
+    )
     run_id = new_run_id(cfg.model, benchmark, strategy_name)
     seed = manifest.get("seed")
     manifest_version = manifest.get("manifest_version")
@@ -161,7 +201,6 @@ def main() -> int:
                 inputs=item.inputs,
                 return_type=item.return_type,
                 strategy=None if cfg.baseline else cfg.strategy,
-                think=cfg.think_override,
                 temperature=resolved_gen["temperature"],
                 top_p=resolved_gen["top_p"],
                 max_retries=resolved_gen["max_retries"],
@@ -172,7 +211,15 @@ def main() -> int:
             ),
             label=f"{benchmark}:{item.item_id}",
         )
-        correct = adapter.compare(result.result, item.expected)
+        correct = (
+            result.exec_status in (None, "ok")
+            and result.validation_status != "unparsed"
+            and not (
+                output_mode is ValidationMode.STRICT
+                and result.validation_status in ("invalid_type", "invalid_constraint")
+            )
+            and adapter.compare(result.result, item.expected)
+        )
         n_correct += bool(correct)
 
         pre_correct = None
@@ -203,8 +250,6 @@ def main() -> int:
             return_type_source=item.return_type_source,
             generation=resolved_gen,
         ))
-
-    from collections import Counter
 
     # Capability accuracy is over SCORABLE invocations only.
     #
