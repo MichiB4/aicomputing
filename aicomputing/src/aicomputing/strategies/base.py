@@ -21,8 +21,8 @@ from ..validation import ValidationMode
 
 logger = logging.getLogger("aicomputing")
 
-# Maximum additional calls after a token-limited response.
-# Each retry doubles the requested output-token budget.
+# Maximum additional calls after a response hits an explicit token budget.
+# Each retry doubles that budget; uncapped requests cannot be expanded.
 _MAX_RETRIES = 5
 
 
@@ -115,8 +115,9 @@ class StrategyResult:
 
     tokens_used: Optional[int] = None
 
-    # Final requested output-token limit; for contract and consistency,
-    # the maximum final limit across their stages or samples.
+    # Final requested output-token limit; None means no application cap.
+    # Contract and consistency report None if any stage/sample was uncapped,
+    # otherwise the maximum final limit. Custom strategies may leave it unset.
     token_budget_used: Optional[int] = None
     retries: int = 0
 
@@ -183,36 +184,42 @@ class Strategy(ABC):
 
 
 def generate_with_retry(
-    call: Callable[[int], GenerateResponse],
+    call: Callable[[Optional[int]], GenerateResponse],
     parse: Callable[[str], Any],
-    initial_budget: int,
+    initial_budget: Optional[int],
     stats: Optional["CallStats"] = None,
     model_name: str = "",
-) -> tuple[Any, GenerateResponse, int, int]:
+) -> tuple[Any, GenerateResponse, int, Optional[int]]:
     """
     Retry token-limited responses with increasing output-token budgets.
 
-    Only responses with finish_reason="length" trigger a retry. Other
-    responses are parsed once. Parser exceptions propagate unchanged.
+    Only responses with finish_reason="length" and an explicit integer
+    budget trigger a retry. None requests no application cap, so a provider
+    output or context limit cannot be expanded here and is not retried.
+    Truncated prefixes are never parsed. Other responses are parsed once.
+    Parser exceptions propagate unchanged.
     A parser may return None as a valid value; this function does not
     distinguish it from a returned None representing failed recovery.
 
     Args:
         call: Generate a response using the supplied output-token budget.
         parse: Recover a Python value from response text.
-        initial_budget: Starting output-token budget; retries may exceed it.
+        initial_budget: Positive starting budget, or None for no application cap.
+            Retries may exceed an explicit starting budget.
         stats: Optional accumulator for each returned backend response.
         model_name: Model identifier used in log messages.
 
     Returns:
         A tuple of (value, final_response, retries, final_budget).
         retries counts additional calls after the first, regardless of
-        success. final_budget is the limit requested for the final call.
+        success. final_budget is the limit requested for the final call,
+        or None when no application cap was requested.
     """
-    if type(initial_budget) is not int:
-        raise TypeError("initial_budget must be an integer")
-    if initial_budget <= 0:
-        raise ValueError("initial_budget must be positive")
+    if initial_budget is not None:
+        if type(initial_budget) is not int:
+            raise TypeError("initial_budget must be an integer or None")
+        if initial_budget <= 0:
+            raise ValueError("initial_budget must be positive")
 
     budget = initial_budget
     last_response = None
@@ -238,6 +245,15 @@ def generate_with_retry(
                     model_name, budget, attempt + 1,
                 )
             return value, response, attempt, budget
+
+        if budget is None:
+            logger.warning(
+                "[retry] %s: response reached a provider output or context "
+                "limit without an application token cap; no larger budget "
+                "can be requested",
+                model_name,
+            )
+            return None, response, 0, None
 
         if attempt == _MAX_RETRIES:
             break

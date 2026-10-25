@@ -6,6 +6,8 @@ including None, are validated by the runtime under the normal output policy.
 Parsing metadata describes the selected answer. Usage includes both stages
 and any token-budget retries; model self-checking does not prove correctness.
 Both stages use the same backend configuration for native reasoning.
+Neither stage imposes an application output-token cap unless the request
+supplies one. Provider output and context limits still apply.
 """
 
 from __future__ import annotations
@@ -13,7 +15,6 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from ..backends.base import Backend
-from ..model_config import get_token_budget
 from ..parsing import ParseOutcome, coerce_type, parse_result_detailed
 from ..prompting import (
     build_contract_check_prompt,
@@ -48,17 +49,13 @@ class ContractStrategy(Strategy):
         backend: Backend,
         feedback: Optional[dict] = None,
     ) -> StrategyResult:
-        # Preserve the existing stage allowances; these do not set native reasoning.
         model_name = request.model or backend.default_model
-        predict_budget_start = request.max_new_tokens or get_token_budget(
-            model_name, extended=False,
-        )
-        check_budget_start = request.max_new_tokens or get_token_budget(
-            model_name, extended=True,
-        )
+        # Both stages inherit an explicit budget or leave generation uncapped.
+        predict_budget_start = request.max_new_tokens
+        check_budget_start = request.max_new_tokens
 
         def make_call(prompt: str):
-            def call(max_new_tokens: int):
+            def call(max_new_tokens: Optional[int]):
                 return backend.generate(
                     prompt,
                     model=request.model,
@@ -166,8 +163,11 @@ class ContractStrategy(Strategy):
             ),
             tokens_used=tokens,
             provider_finish_reason=check_response.provider_finish_reason,
-            # Report the larger final allowance across the two stages.
-            token_budget_used=max(predict_budget, check_budget),
+            # Any uncapped stage makes the combined allowance uncapped.
+            token_budget_used=(
+                None if predict_budget is None or check_budget is None
+                else max(predict_budget, check_budget)
+            ),
             retries=predict_retries + check_retries,
             call_stats=stats,
             # Describe the selected answer's parsing outcome.

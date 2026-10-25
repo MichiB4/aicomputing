@@ -41,7 +41,8 @@ def main(argv=None):
     p.add_argument("--strategy", default="direct", choices=list_strategies())
     p.add_argument("--temp", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=None, dest="max_tokens",
-               help="Starting token budget; automatic truncation retries may increase it")
+               help=("Optional starting output-token allowance; omitted means no application cap. "
+                     "Truncation retries may increase an explicit allowance."))
     p.add_argument("--no-strict", action="store_true", help="Disable strict type checking")
     p.add_argument("--trace", default=None, help="Write JSONL trace of LLM calls")
     p.add_argument("--reasoning-effort", default=None,

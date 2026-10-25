@@ -11,12 +11,13 @@ These instructions do not establish prediction correctness.
 
 Native reasoning is configured by the backend rather than selected by
 this strategy. The prompt only offers a choice of visible response style.
-The default initial output-token budget is 8192; request.max_new_tokens
-overrides that starting allowance.
+There is no application output-token cap unless request.max_new_tokens
+supplies one. Provider output and context limits still apply.
 
-Token-limit retries can make up to five additional calls, doubling the
-budget without a package-level cap. Runtime validation retries may repeat
-the strategy according to request.max_retries.
+Token-limit retries can make up to five additional calls, doubling an explicit
+starting budget. Uncapped requests do not retry provider truncation within the
+strategy. Runtime validation retries may repeat the strategy according to
+request.max_retries.
 """
 
 from __future__ import annotations
@@ -24,7 +25,6 @@ from __future__ import annotations
 from typing import Optional
 
 from ..backends.base import Backend
-from ..model_config import get_token_budget
 from ..prompting import build_confidence_prompt, build_retry_prompt
 from ..request import ExecuteRequest
 from .base import (
@@ -66,13 +66,10 @@ class ConfidenceStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        # Allow room for visible tracing independently of native reasoning
-        # configuration.
-        initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, extended=True,
-        )
+        # None leaves output length to the provider rather than a strategy cap.
+        initial_budget = request.max_new_tokens
 
-        def call(max_new_tokens: int):
+        def call(max_new_tokens: Optional[int]):
             return backend.generate(
                 prompt,
                 model=request.model,

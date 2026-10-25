@@ -3,9 +3,9 @@
 The strategy requests a result object. Native reasoning is configured by
 the backend rather than selected by this strategy.
 
-The initial output-token budget comes from get_token_budget unless
-request.max_new_tokens supplies one. Token-limit retries double the
-budget for up to five additional attempts, without a package-level cap.
+There is no application output-token cap unless request.max_new_tokens
+supplies one. Token-limit retries double an explicit starting budget for
+up to five additional attempts. Provider limits still apply to uncapped calls.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 from typing import Optional
 
 from ..backends.base import Backend
-from ..model_config import get_token_budget
 from ..prompting import build_direct_prompt, build_retry_prompt
 from ..request import ExecuteRequest
 from .base import (
@@ -55,12 +54,10 @@ class DirectStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        # Preserve the existing default allowance; this does not set native reasoning.
-        initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, extended=False,
-        )
+        # None leaves output length to the provider rather than a strategy cap.
+        initial_budget = request.max_new_tokens
 
-        def call(max_new_tokens: int):
+        def call(max_new_tokens: Optional[int]):
             return backend.generate(
                 prompt,
                 model=request.model,

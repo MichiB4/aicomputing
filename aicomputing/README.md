@@ -210,7 +210,7 @@ The stable core of a request is:
 | `strategy` | Optional per-call strategy override |
 | `model` | Optional per-call model override |
 | `temperature`, `top_p` | Generation controls |
-| `max_new_tokens` | Optional starting allowance; truncation retries may increase it |
+| `max_new_tokens` | `None` by default: no application output-token cap; a positive starting allowance opts in, and truncation retries may increase it |
 | `max_retries` | Maximum validation retries |
 | `validation_mode` | `"warn"` or `"strict"` structural-validation policy |
 
@@ -283,7 +283,7 @@ Implements **execute -> check -> revise**:
 2. present that candidate back to the model as unverified;
 3. accept it or return a replacement.
 
-Both stages use the same configured backend-native reasoning settings. Their default starting allowances remain 512 and 8192 tokens, with preserved model-specific budget rules for prediction. The initial and final values are retained so beneficial and harmful revisions can be measured separately.
+Both stages use the same configured backend-native reasoning settings. Neither stage has an application output-token cap by default. An explicit positive `max_new_tokens` starts both stages at that allowance; each stage can increase it independently after truncation. The initial and final values are retained so beneficial and harmful revisions can be measured separately.
 
 Contract checking is **model-based semantic self-checking**, not formal verification.
 
@@ -416,9 +416,9 @@ order through retries, traces, and canonical result CSVs. Other backends report
 ordinary CoT text can be requested independently of native thinking.
 
 `ExecuteRequest.think`, the inferred result fields and universal CLI
-`--think`/`--no-think` flags are removed. Starting-budget selection remains
-separate: `get_token_budget(model, extended=...)` preserves existing numeric
-allowances without configuring native controls.
+`--think`/`--no-think` flags are removed. Output-token limits are separate from
+native reasoning: model names and prompting strategies do not introduce a cap.
+The compatibility helper `get_token_budget(model, extended=...)` returns `None`.
 
 ---
 
@@ -450,10 +450,29 @@ Both modes use the same limited conversions; neither truncates a fractional floa
 
 The framework distinguishes:
 
-1. **validation retries** — a complete response was produced but did not satisfy the required structure or constraints;
+1. **validation retries** — output recovery, type/constraint validation, or generated-program execution failed;
 2. **token-budget retries** — generation ended because the model hit its output limit.
 
 Token usage and model-call counts accumulate across all calls and retries.
+
+### Output-token allowances
+
+`max_new_tokens=None` (the default), or JSON `null` in a manifest, means no
+application output-token cap. OpenAI-compatible requests omit the output-limit
+field; Ollama receives `num_predict=-1`. The Hugging Face backend must provide a
+finite generation stopping bound: it uses the model's declared context capacity
+minus the prompt length, falling back to tokenizer metadata only when the model
+does not declare a capacity. An explicit allowance is required if neither source
+provides a finite capacity. Provider defaults, model output limits, and context windows
+still apply; omitting an application cap does not guarantee unlimited generation.
+
+A positive `max_new_tokens` or `--max-tokens` value is an explicit **starting
+allowance**, not a hard ceiling. A token-limited response can trigger up to five
+additional calls, doubling that allowance each time. Each call starts generation
+again and its usage is counted. With no application cap there is no allowance to
+increase, so a token-limited response is kept as truncated without a token-budget
+retry or parsing its incomplete prefix. Normal validation retries are separate
+and can still request a new answer with feedback.
 
 ---
 
@@ -646,12 +665,14 @@ and uses Python's normalized function name. Invalid headers fail immediately;
 this check does not execute default expressions or change the general oracle's
 signature-parsing policy.
 
-The baseline starts with 512 output tokens unless an explicit positive starting
-allowance is supplied. A token-limited response triggers up to five additional
-calls, doubling the allowance each time and recording usage from every response.
-After six truncated responses, the partial code is not executed; the outcome is
-`generated_code_truncated` with `exec_status="truncated"`, a scorable failure.
-A genuine successful return of `None` remains distinct from this missing result.
+The baseline has no application output-token cap by default. With an explicit
+positive starting allowance, a token-limited response triggers up to five
+additional calls, doubling the allowance each time and recording usage from
+every response. With no application cap, it does not repeat the same request
+as a token-budget retry. Partial code is never executed after a truncated final
+response; the outcome is `generated_code_truncated` with `exec_status="truncated"`,
+a scorable failure. A genuine successful return of `None` remains distinct from
+this missing result.
 
 Runtime validation retries are separate. When validation triggers another attempt,
 the baseline includes the previous generated response and validation error and
@@ -660,8 +681,9 @@ errors and execution timeouts also use this retry allowance, even for return typ
 that permit `None`. Exhausted execution failures remain unsuccessful and scorable;
 a successful execution returning `None` is validated normally. Benchmark expected
 answers are not supplied as feedback. With the default one validation retry,
-repeated exhaustion can use two attempts of six backend calls each. Internal SDK
-HTTP retries are separate from these counts. The generated-code process timeout
+an explicit allowance and repeated token-budget exhaustion can use two attempts
+of six backend calls each. Internal SDK HTTP retries are separate from these
+counts. The generated-code process timeout
 remains 10 seconds and does not limit model generation time. Aggregated summaries
 append `exec_truncated` and include those failures in `exec_failure_rate`.
 
@@ -707,7 +729,7 @@ Rebuilding with matching selection inputs and rules reproduces the selection, no
 
 Current code requires integer manifest schema version **2** and selection compatibility version **4**. Selection compatibility also covers content-fingerprint encoding, so schema version 2 alone is insufficient. Manifests with earlier selection versions must be rebuilt; reproduce historical runs with their corresponding code revision.
 
-Historical `pilot-v2.json` and `main-v1.json` use the old schema. Current pilot/main presets use experiment IDs `pilot-v3` / `main-v2`; those names do not establish compatibility. Generate compatible manifests explicitly. Historical files are not automatically converted.
+Historical `pilot-v2.json` and `main-v1.json` use the old schema. Current pilot/main presets use experiment IDs `pilot-v3` / `main-v2`; those names do not establish compatibility. Generate compatible manifests explicitly. Historical files are not automatically converted. Earlier code treated `max_new_tokens: null` as a model/strategy starting allowance; current code treats it as no application cap. Reproduce historical runs with their original code revision and recorded settings.
 
 For a reportable run, create a model configuration file such as:
 
@@ -715,18 +737,22 @@ For a reportable run, create a model configuration file such as:
 {
   "model/id-a": {
     "provider": "groq",
-    "max_new_tokens": 4096,
+    "max_new_tokens": null,
     "reasoning": {}
   },
   "model/id-b": {
     "provider": "cerebras",
-    "max_new_tokens": 8192,
+    "max_new_tokens": null,
     "reasoning": {}
   }
 }
 ```
 
 Do **not** store API keys in this file.
+
+Keep `max_new_tokens` null to avoid an application cap. Set a positive value
+only when you want an explicit starting allowance; token-budget retries may
+increase it. A per-model null overrides a numeric global manifest allowance.
 
 Then build a frozen manifest from the workspace root:
 

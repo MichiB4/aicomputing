@@ -3,6 +3,9 @@
 Uses the optional OpenAI client with a configurable endpoint and model.
 Compatibility depends on the server's implementation of the API.
 
+None omits the output-token limit; provider defaults and model capacities
+still apply. Explicit positive allowances are sent as max_tokens.
+
 Native reasoning uses an optional backend-level reasoning_effort setting.
 When configured, its literal value is sent to the provider; otherwise the
 parameter is omitted. Support and interpretation depend on the endpoint
@@ -20,6 +23,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from ..request import validate_generation_limits
 from ._text_utils import strip_thinking
 from .base import (
     Backend,
@@ -119,7 +123,7 @@ class OpenAICompatBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
@@ -140,18 +144,21 @@ class OpenAICompatBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported generation options: {names}")
+        validate_generation_limits(max_new_tokens, 0)
 
         client = self._get_client()
         mdl = model or self._model_name
 
         api_kwargs: Dict[str, Any] = {}
+        if max_new_tokens is not None:
+            api_kwargs["max_tokens"] = max_new_tokens
         if stop:
             api_kwargs["stop"] = list(stop)
         if self._reasoning_effort is not None:
@@ -166,7 +173,6 @@ class OpenAICompatBackend(Backend):
                 messages=messages,
                 temperature=temperature,
                 top_p=top_p,
-                max_tokens=max_new_tokens,
                 **api_kwargs,
             )
         except APITimeoutError as exc:

@@ -7,6 +7,9 @@ Support depends on the actual template; the recorded setting is not
 proof of the model's reasoning mode. Each instance uses its configured
 model. Nonempty stop sequences are not supported.
 
+None permits generation until EOS or the remaining declared model context.
+An explicit positive allowance is required when context capacity is unknown.
+
 Recognized leading <think> blocks are removed from decoded output. A
 rendered template ending in <think> supplies the opener for cleanup.
 The decoded completion is retained in raw metadata.
@@ -19,8 +22,36 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from ..request import validate_generation_limits
 from ._text_utils import strip_thinking
 from .base import Backend, GenerateResponse, ReasoningCapabilities
+
+
+def _declared_context_length(model: Any, tokenizer: Any) -> Optional[int]:
+    """Find the authoritative finite model context, ignoring output defaults.
+
+    Transformers uses values around 1e30 when tokenizer capacity is unknown.
+    Its own LARGE_INTEGER threshold is 1e20; those sentinels are not usable
+    context windows. Prefer a text-specific configuration, then the model's
+    configuration. Within either, prefer max_position_embeddings, followed
+    by the listed legacy aliases. A tokenizer limit is only a fallback: stale
+    tokenizer or legacy values must not clip a canonical model declaration.
+    Sliding windows and RoPE factors are not total context lengths.
+    """
+    config = getattr(model, "config", None)
+    configurations = (getattr(config, "text_config", None), config)
+    for configuration in configurations:
+        for field in (
+            "max_position_embeddings", "n_positions", "n_ctx",
+            "max_seq_len", "max_sequence_length", "seq_length",
+        ):
+            value = getattr(configuration, field, None)
+            if type(value) is int and 0 < value < 10**20:
+                return value
+    value = getattr(tokenizer, "model_max_length", None)
+    if type(value) is int and 0 < value < 10**20:
+        return value
+    return None
 
 
 class HFBackend(Backend):
@@ -106,13 +137,14 @@ class HFBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported generation options: {names}")
+        validate_generation_limits(max_new_tokens, 0)
         if model is not None and model != self._model_name:
             raise ValueError(
                 f"HFBackend cannot use model {model!r}; it is configured for "
@@ -146,6 +178,23 @@ class HFBackend(Backend):
         inputs = self._tokenizer(
             [text], return_tensors="pt", add_special_tokens=not has_chat_template,
         ).to(self._device)
+        input_length = len(inputs.input_ids[0])
+        context_length = _declared_context_length(self._model, self._tokenizer)
+        effective_max_new_tokens = max_new_tokens
+        if effective_max_new_tokens is None:
+            # Omitting this option can restore Transformers' 20-token default.
+            # Use the model's remaining context rather than an arbitrary cap.
+            if context_length is None:
+                raise ValueError(
+                    "HFBackend cannot infer a finite model context length; "
+                    "set an explicit positive max_new_tokens for this model."
+                )
+            effective_max_new_tokens = context_length - input_length
+            if effective_max_new_tokens <= 0:
+                raise ValueError(
+                    f"HFBackend input uses {input_length} tokens and leaves no "
+                    f"generation space in the {context_length}-token context."
+                )
 
         eos_token_id = self._model.generation_config.eos_token_id
         if eos_token_id is None:
@@ -155,7 +204,7 @@ class HFBackend(Backend):
         )
 
         gen_kwargs: Dict[str, Any] = {
-            "max_new_tokens": max_new_tokens,
+            "max_new_tokens": effective_max_new_tokens,
             "pad_token_id": self._tokenizer.pad_token_id,
             "eos_token_id": eos_token_id,
         }
@@ -167,7 +216,7 @@ class HFBackend(Backend):
         with torch.inference_mode():
             gen_ids = self._model.generate(**inputs, **gen_kwargs)
 
-        new_tokens = gen_ids[0][len(inputs.input_ids[0]):]
+        new_tokens = gen_ids[0][input_length:]
         generated_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
         raw_text = generated_text.strip()
         # A template may supply the opener before newly generated tokens begin.
@@ -182,17 +231,28 @@ class HFBackend(Backend):
             n_new > 0
             and new_tokens[-1].item() in eos_token_ids
         )
-        finish_reason = "length" if (n_new >= max_new_tokens and not ended_with_eos) else "stop"
+        finish_reason = (
+            "length" if (n_new >= effective_max_new_tokens and not ended_with_eos)
+            else "stop"
+        )
 
         return GenerateResponse(
             text=raw_text,
             model=self._model_name,
             tokens_used=n_new,
-            input_tokens=len(inputs.input_ids[0]),
+            input_tokens=input_length,
             output_tokens=n_new,
             requested_reasoning=dict(template_kwargs),
             finish_reason=finish_reason,
-            raw={"generated_text": generated_text},
+            raw={
+                "generated_text": generated_text,
+                "generation_limits": {
+                    "policy": "model_context" if max_new_tokens is None else "explicit",
+                    "requested_max_new_tokens": max_new_tokens,
+                    "effective_max_new_tokens": effective_max_new_tokens,
+                    "context_length": context_length,
+                },
+            },
         )
 
     def is_available(self) -> bool:

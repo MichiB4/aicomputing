@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from ..request import validate_generation_limits
 from .reasoning import ReasoningCapabilities
 
 logger = logging.getLogger("aicomputing")
@@ -297,7 +298,7 @@ class Backend(ABC):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
@@ -313,7 +314,10 @@ class Backend(ABC):
         already normalised to "stop" or "length" (see normalize_finish_reason);
         the strategy layer tests for "length" exactly.
 
-        The default initial token allowance comes from model_config.
+        None requests generation without an application output-token cap.
+        Provider and model context/output limits still apply. A backend that
+        requires a concrete allowance must use a known model limit or raise
+        a clear error requesting an explicit positive allowance.
         Native reasoning settings belong to backend configuration rather
         than this per-call interface. Implementations must reject unsupported
         keyword arguments, including the removed per-call think argument.
@@ -326,13 +330,14 @@ class Backend(ABC):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         **kwargs,
     ) -> GenerateResponse:
         """
         Chat-style generation (system + user messages).
         Default implementation concatenates into a single prompt.
         """
+        validate_generation_limits(max_new_tokens, 0)
         if "think" in kwargs:
             raise TypeError(
                 "The per-call 'think' argument is no longer supported; "

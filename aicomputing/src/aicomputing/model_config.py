@@ -1,8 +1,8 @@
-"""Shared starting-token allowances and static provider presets.
+"""Uncapped generation defaults and static provider presets.
 
-The ordered model-name rules preserve existing budget choices. They do not
-classify native reasoning capabilities or configure backend thinking controls.
-Explicit backend settings determine which native controls are sent.
+Model names and prompting strategies do not impose output allowances.
+Explicit caller limits and provider/model capacities still apply.
+Native reasoning controls are configured independently.
 
 Provider presets contain static connection settings and example model IDs;
 they do not verify current model availability or account limits.
@@ -13,53 +13,17 @@ from __future__ import annotations
 from typing import Optional
 
 
-_BUDGET_DEFAULT = 512
-_BUDGET_EXTENDED = 8192
-
-# Default for direct backend calls that omit max_new_tokens.
-DEFAULT_MAX_NEW_TOKENS = _BUDGET_DEFAULT
-
-# First matching lowercase substring wins. Preserve this order, including
-# smaller-budget entries that can precede other patterns in combined names.
-_MODEL_BUDGETS: list[tuple[str, int]] = [
-    ('deepseek-r1', _BUDGET_EXTENDED),
-    ('deepseek/r1', _BUDGET_EXTENDED),
-    ('r1-distill', _BUDGET_EXTENDED),
-    ('qwen3-4b-instruct-2507', _BUDGET_DEFAULT),
-    ('qwen3-30b-a3b-instruct-2507', _BUDGET_DEFAULT),
-    ('qwen3-235b-a22b-instruct-2507', _BUDGET_DEFAULT),
-    ('qwen3:4b-instruct', _BUDGET_DEFAULT),
-    ('qwen3:30b-a3b-instruct-2507', _BUDGET_DEFAULT),
-    ('qwen3:30b-instruct', _BUDGET_DEFAULT),
-    ('qwen3:235b-a22b-instruct-2507', _BUDGET_DEFAULT),
-    ('qwen3:235b-instruct', _BUDGET_DEFAULT),
-    ('qwen3-4b-thinking-2507', _BUDGET_EXTENDED),
-    ('qwen3-30b-a3b-thinking-2507', _BUDGET_EXTENDED),
-    ('qwen3-235b-a22b-thinking-2507', _BUDGET_EXTENDED),
-    ('qwen3:4b-thinking', _BUDGET_EXTENDED),
-    ('qwen3:30b-a3b-thinking-2507', _BUDGET_EXTENDED),
-    ('qwen3:30b-thinking', _BUDGET_EXTENDED),
-    ('qwen3:235b-a22b-thinking-2507', _BUDGET_EXTENDED),
-    ('qwen3:235b-thinking', _BUDGET_EXTENDED),
-    ('qwen3', _BUDGET_DEFAULT),
-    ('qwq', _BUDGET_EXTENDED),
-    ('gpt-oss', _BUDGET_EXTENDED),
-]
+# No application-imposed output allowance unless the caller requests one.
+DEFAULT_MAX_NEW_TOKENS: Optional[int] = None
 
 
-def get_token_budget(model: str, extended: bool) -> int:
-    """Select a starting allowance without configuring native reasoning.
+def get_token_budget(model: str, extended: bool) -> Optional[int]:
+    """Return the uncapped default through the legacy configuration helper.
 
-    Extended calls receive 8192 tokens. Other calls use the ordered model
-    rules, falling back to 512. Automatic truncation retries may grow either.
+    The arguments remain accepted for callers using the existing interface.
+    Native reasoning is configured independently of the output allowance.
     """
-    if extended:
-        return _BUDGET_EXTENDED
-    lower = model.lower()
-    for pattern, budget in _MODEL_BUDGETS:
-        if pattern in lower:
-            return budget
-    return _BUDGET_DEFAULT
+    return DEFAULT_MAX_NEW_TOKENS
 
 
 # ---------------------------------------------------------------------------

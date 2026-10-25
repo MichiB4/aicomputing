@@ -47,8 +47,9 @@ class ExecuteRequest:
     temperature: float = 0.0
     top_p: float = 1.0
 
-    # Positive initial token budget. None selects the model/strategy default.
-    # Token-limit retries may increase this budget.
+    # Positive initial output-token budget, or None for no application cap.
+    # Providers still enforce their own limits. Token-limit retries may grow
+    # an explicit budget; validation retries are configured separately below.
     max_new_tokens: Optional[int] = None
 
     # Strategy override; None uses the runtime default.
@@ -251,7 +252,7 @@ class ExecuteResult:
     reasoning_requests: List[Optional[Dict[str, Any]]] = field(default_factory=list)
 
     # Output-token ceiling reported by the strategy, not tokens consumed.
-    # None means no budget was recorded.
+    # None means no application cap, or no budget recorded (e.g. a cache hit).
     token_budget_used: Optional[int] = None
 
     # Elapsed invocation time in milliseconds, including execution retries.

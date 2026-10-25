@@ -92,7 +92,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     --ollama-think    Ollama true/false or a model-specific level string.
     --hf-thinking / --no-hf-thinking  HF chat-template Boolean override.
     --trace          JSONL trace destination.
-    --max-tokens     Starting output-token budget; truncation retries may grow it.
+    --max-tokens     Optional starting allowance; omitted means no application cap.
 
     Native reasoning options are omitted by default and apply independently of
     the prompting strategy. Options for a different backend are rejected.
@@ -131,8 +131,8 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--max-tokens", type=int, default=None, dest="max_tokens",
         help=(
-            "Starting output-token budget; truncation retries may increase it. "
-            "When omitted, use the run or strategy defaults."
+            "Optional starting output-token allowance; truncation retries may increase it. "
+            "When omitted, inherit the manifest setting, or use no application cap."
         ),
     )
     ap.add_argument(

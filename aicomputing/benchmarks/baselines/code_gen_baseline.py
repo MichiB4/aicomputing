@@ -9,6 +9,9 @@ Generated truncation, syntax errors, program errors and worker-wait timeouts
 are scorable outcomes. Invalid declared headers and execution-machinery
 failures propagate for the benchmark wrapper to classify as harness failures.
 Provider exceptions also propagate for their existing classification.
+Generation has no application output-token cap unless the request supplies
+one; provider output and context limits still apply. Truncated source is
+never executed, whether the request had an explicit token budget or not.
 
 The restricted environment is not a security boundary. Results must support
 multiprocessing serialization. See _sandbox_exec for the timeout's scope.
@@ -282,11 +285,9 @@ class CodeGenBaseline(Strategy):
                 "and address the validation error. Return Python code only, "
                 "using the implementation format requested above."
             )
-        initial_budget = (
-            request.max_new_tokens if request.max_new_tokens is not None else 512
-        )
+        initial_budget = request.max_new_tokens
 
-        def call(budget: int):
+        def call(budget: Optional[int]):
             return backend.generate(
                 prompt, model=request.model, temperature=request.temperature,
                 top_p=request.top_p, max_new_tokens=budget,
@@ -301,11 +302,11 @@ class CodeGenBaseline(Strategy):
         value = None
         exec_status = "truncated" if truncated else "ok"
         error_message = (
-            "Generation remained truncated after token-budget retries."
+            "Generation ended at an output or context limit."
             if truncated else None
         )
 
-        # Never execute a prefix still marked as truncated after exhaustion.
+        # Never execute a prefix still marked as truncated.
         if not truncated:
             func_code = _assemble_function(
                 body, request.signature, request.docstring, func_name,

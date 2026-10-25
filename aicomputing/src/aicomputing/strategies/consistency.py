@@ -8,6 +8,8 @@ usage and token-budget retry counts are accumulated across samples.
 Every sample requests temperature=0.0, regardless of the request setting.
 Native reasoning is configured by the backend rather than selected by
 this strategy.
+Samples have no application output-token cap unless the request supplies one.
+Provider output and context limits still apply.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from __future__ import annotations
 from typing import Any, List, Optional, Tuple
 
 from ..backends.base import Backend
-from ..model_config import get_token_budget
 from ..parsing import ParseOutcome
 from ..prompting import build_cot_prompt, build_retry_prompt
 from ..request import ExecuteRequest
@@ -65,12 +66,10 @@ class SelfConsistencyStrategy(Strategy):
                 error_message=feedback.get("error", ""),
             )
 
-        # Preserve the existing default allowance; this does not set native reasoning.
-        initial_budget = request.max_new_tokens or get_token_budget(
-            request.model or backend.default_model, extended=True,
-        )
+        # None leaves output length to the provider rather than a strategy cap.
+        initial_budget = request.max_new_tokens
 
-        def call(max_new_tokens: int):
+        def call(max_new_tokens: Optional[int]):
             return backend.generate(
                 prompt,
                 model=request.model,
@@ -116,8 +115,11 @@ class SelfConsistencyStrategy(Strategy):
         ]
         total_tokens = sum(reported_tokens) if reported_tokens else None
         total_retries = sum(sample.retries for sample in samples)
-        # Report the largest final allowance requested by any sample.
-        max_budget = max(sample.token_budget_used for sample in samples)
+        # Any uncapped sample makes the combined allowance uncapped.
+        budgets = [sample.token_budget_used for sample in samples]
+        max_budget = (
+            None if any(budget is None for budget in budgets) else max(budgets)
+        )
 
         return StrategyResult(
             value=winner.value,

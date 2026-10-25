@@ -6,9 +6,9 @@ think setting is sent as a native request field; omission uses the model
 default. Support and interpretation depend on the SDK, server and model.
 Recorded settings describe requests, not proof of their effect.
 
-Token budgets are determined by the caller (via model_config.get_token_budget)
-and passed in as max_new_tokens. This backend uses them exactly as given —
-no floors, no multipliers. Retry-on-cutoff is handled by the strategy layer.
+None removes the application output-token cap using num_predict=-1.
+Explicit positive token allowances are passed through unchanged.
+Retry-on-cutoff for explicit allowances is handled by the strategy layer.
 
 finish_reason is "stop" for a clean completion, "length" if the model hit
 the token limit before finishing.
@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 from ..model_config import DEFAULT_MAX_NEW_TOKENS
+from ..request import validate_generation_limits
 from ._text_utils import strip_thinking
 from .base import (
     Backend,
@@ -174,7 +175,7 @@ class OllamaBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         stop: Optional[List[str]] = None,
         seed: Optional[int] = None,
         **kwargs,
@@ -199,7 +200,7 @@ class OllamaBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
         seed: Optional[int] = None,
         stop: Optional[List[str]] = None,
         **kwargs,
@@ -207,6 +208,7 @@ class OllamaBackend(Backend):
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported generation options: {names}")
+        validate_generation_limits(max_new_tokens, 0)
 
         client = self._get_client()
         mdl = model or self._default_model
@@ -218,7 +220,9 @@ class OllamaBackend(Backend):
         options: Dict[str, Any] = {
             "temperature": float(temperature),
             "top_p": float(top_p),
-            "num_predict": int(max_new_tokens),
+            # Ollama documents -1 as unlimited generation. Send it explicitly
+            # so a finite Modelfile default does not reinstate an output cap.
+            "num_predict": -1 if max_new_tokens is None else max_new_tokens,
         }
         if seed is not None:
             options["seed"] = int(seed)
