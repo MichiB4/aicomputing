@@ -1,29 +1,15 @@
-"""Build prompts for AI Computing strategies and the code-generation baseline.
+"""Build prediction, contract-check, validation-retry, and code-generation prompts.
 
-Prediction prompt builders:
-- build_direct_prompt: request a predicted result without an explanation.
-- build_cot_prompt: request an execution trace with variable-state tracking.
-- build_pseudocode_prompt: request a procedure followed by its simulation.
-- build_confidence_prompt: let the model choose whether to provide a trace.
-- build_contract_check_prompt: request a check of a proposed result.
-
-Hybrid delegates to the direct or CoT strategy. Consistency repeatedly
-uses the CoT prompt. Contract uses the direct prompt for its initial
-prediction, followed by the contract-check prompt.
-
-build_codegen_prompt requests a Python function body for the comparison
-baseline. This module constructs that prompt; it does not execute code.
-
-build_retry_prompt appends a previous response and validation feedback
-to an existing prompt.
-
-Prompt instructions and examples request particular response formats.
-They do not guarantee model compliance or prediction correctness.
+Hybrid delegates to direct/CoT; consistency repeats CoT; contract predicts with
+direct before checking. Code-generation prompts request bodies without executing
+them. Instructions and examples do not guarantee compliance or correctness.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+from .answer_protocol import FRAMED_V1, FRAMED_TEXT_V1, LEGACY, frame_answer, validate_answer_format
 
 
 def _format_prompt_value(value: Any) -> str:
@@ -79,9 +65,123 @@ or dictionary keys. Use only literal data; set() is allowed for an empty set. \
 Do not include executable statements or other function calls."""
 
 
-# ---------------------------------------------------------------------------
+TASK_INSTRUCTIONS = """\
+Predict the Python return value required by the supplied signature,
+docstring, and concrete inputs.
+
+Implementation code is intentionally omitted. Apply the behavior
+specified in the docstring. The absence of implementation code alone
+is not a reason to decline. Do not invent unspecified behavior.
+
+Worked examples demonstrate the method and response format.
+Answer only the ACTUAL TASK."""
+
+
+FRAMED_VALUE_RULES = """\
+Put exactly one final-answer block at the end of your response:
+BEGIN FINAL ANSWER
+<one complete result object, or verdict object for a check>
+END FINAL ANSWER
+The marker lines are boundaries, not part of the returned value. Put any
+permitted reasoning before the block. Write nothing after END FINAL ANSWER.
+Inside the block, output one complete literal object and nothing else.
+Use fully evaluated values, not arithmetic expressions or function calls.
+Never use question marks, ellipses, placeholders, or omitted digits in a
+numeric answer. Provide sufficient floating-point digits; do not round unless
+the specification requests rounding. Close every bracket and parenthesis,
+preserve nesting and dictionary key types, and include the comma in a
+singleton tuple, for example (20,). Preserve punctuation that is actually
+part of a required string value. Escape newlines in string literals so a
+line of data cannot be mistaken for a boundary marker."""
+
+
+FRAMED_PROMPT_REVISION = "final_answer_reminder_v1"
+
+
+def _final_answer_reminder(*, verdict: bool) -> str:
+    """Keep the required answer next to the task, after any worked examples."""
+    schema = (
+        '{"verdict": <"accept" or "revise">, "result": <complete concrete value>}'
+        if verdict else '{"result": <complete concrete value>}'
+    )
+    return (
+        "FINAL RESPONSE REQUIREMENT FOR THE ACTUAL TASK\n"
+        "Complete every requested part of your response, including the final answer. "
+        "After any requested procedure, trace, simulation, or check, write the "
+        "concrete value explicitly in the final-answer block. A return instruction "
+        "or a State: record does not replace the final answer. "
+        "Do not stop after the explanation.\n"
+        "Finish your response in this exact structure, replacing the placeholders "
+        "with complete literal data for the actual task:\n"
+        f"{frame_answer(schema)}\n"
+        "Write nothing after END FINAL ANSWER."
+    )
+
+
+def _framed_examples(examples: str) -> str:
+    """Wrap only the known, complete result lines in our worked examples."""
+    import json
+    result = []
+    for line in examples.splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            value = None
+        if type(value) is dict and set(value) in ({"result"}, {"verdict", "result"}):
+            line = frame_answer(line)
+        result.append(line)
+    return "\n".join(result)
+
+
+def _build_prediction_prompt(
+    strategy_instructions: str,
+    task: str,
+    response_cue: str,
+    worked_examples: str | None,
+    answer_format: str = LEGACY,
+    *, verdict: bool = False,
+) -> str:
+    """Separate instructions, illustrative examples, and the actual task."""
+    validate_answer_format(answer_format)
+    if answer_format in (FRAMED_V1, FRAMED_TEXT_V1):
+        strategy_instructions = strategy_instructions.replace(
+            "On the final line,", "Inside the final-answer block,"
+        ).replace("only the result object.", "only the final-answer block.").replace(
+            "End your response with a single verdict object on its own line, in one of",
+            "Put a single verdict object in the final-answer block, in one of",
+        )
+        if worked_examples is not None:
+            worked_examples = _framed_examples(worked_examples)
+    parts = [
+        f"TASK INSTRUCTIONS\n{TASK_INSTRUCTIONS}",
+        "STRATEGY AND RESPONSE FORMAT\n"
+        f"{strategy_instructions}\n\n"
+        "Angle-bracketed text in a response schema is a placeholder. "
+        "Replace it with the required value; do not output the placeholder text.",
+        "VALUE NOTATION — FORMATTING EXAMPLES ONLY\n"
+        f"{RESULT_VALUE_FORMAT}\n"
+        "These examples illustrate notation; they do not answer the actual task. "
+        "Use the object keys required by the strategy above.",
+    ]
+    if answer_format in (FRAMED_V1, FRAMED_TEXT_V1):
+        parts.append(FRAMED_VALUE_RULES)
+    if worked_examples is not None:
+        parts.append(f"BEGIN WORKED EXAMPLES\n\n{worked_examples}\n\nEND WORKED EXAMPLES")
+    parts.append(f"BEGIN ACTUAL TASK\n{task}\nEND ACTUAL TASK")
+    if answer_format in (FRAMED_V1, FRAMED_TEXT_V1):
+        parts.append(_final_answer_reminder(verdict=verdict))
+        response_cue = {
+            "Output:": "Final-answer block:",
+            "Trace:": "Trace, then final-answer block:",
+            "Procedure:": "Procedure, then simulation, then final-answer block:",
+            "Check:": "Check, then final-answer block:",
+            "Answer:": "Answer, with any needed trace before the final-answer block:",
+        }.get(response_cue, response_cue)
+    parts.append(f"YOUR RESPONSE TO THE ACTUAL TASK:\n{response_cue}")
+    return "\n\n".join(parts)
+
+
 # Direct prediction prompt
-# ---------------------------------------------------------------------------
 
 DIRECT_SYSTEM = """\
 You are a virtual runtime. Given a Python function's signature, docstring, \
@@ -91,21 +191,32 @@ Do not include prose, code, or explanations — only the result object."""
 
 # Examples demonstrate the result-object format without explanatory traces.
 DIRECT_FEWSHOT = """\
-# Output format examples
+BEGIN EXAMPLE 1
+Example task:
 Signature: add(a: int, b: int) -> int
 Docstring: Return the sum of a and b.
 Inputs (Python values): {"a": 2, "b": 3}
-Output: {"result": 5}
+Example response:
+{"result": 5}
+END EXAMPLE 1
 
+BEGIN EXAMPLE 2
+Example task:
 Signature: repeat(s: str, n: int) -> str
 Docstring: Return s repeated n times.
 Inputs (Python values): {"s": "ha", "n": 3}
-Output: {"result": "hahaha"}
+Example response:
+{"result": "hahaha"}
+END EXAMPLE 2
 
+BEGIN EXAMPLE 3
+Example task:
 Signature: max_of_two(x: float, y: float) -> float
 Docstring: Return the larger of x and y.
 Inputs (Python values): {"x": 1.5, "y": -4.2}
-Output: {"result": 1.5}"""
+Example response:
+{"result": 1.5}
+END EXAMPLE 3"""
 
 
 def build_direct_prompt(
@@ -113,60 +224,62 @@ def build_direct_prompt(
     docstring: str,
     inputs: dict[str, Any],
     include_fewshot: bool = True,
+    *, answer_format: str = LEGACY,
 ) -> str:
     """Build a direct-prediction prompt, optionally including examples."""
     inputs_text = _format_prompt_value(inputs)
     user_block = (
         f"Signature: {signature}\n"
-        f"Docstring: {docstring}\n"
-        f"Inputs (Python values): {inputs_text}\n"
-        f"Output:"
+        f"Specification (docstring):\n{docstring}\n"
+        f"Inputs (Python values): {inputs_text}"
     )
-    parts = [DIRECT_SYSTEM, RESULT_VALUE_FORMAT]
-    if include_fewshot:
-        parts.append(DIRECT_FEWSHOT)
-    parts.append(user_block)
-    return "\n\n".join(parts)
+    return _build_prediction_prompt(
+        DIRECT_SYSTEM, user_block, "Output:",
+        DIRECT_FEWSHOT if include_fewshot else None, answer_format,
+    )
 
 
-# ---------------------------------------------------------------------------
 # Structured chain-of-thought prompt
 #
-# Request a predicted execution trace organized into sequential steps,
-# branch decisions, and loop iterations, with variable-state snapshots.
+# Request a trace of the specified behavior, with conditional steps and
+# repeated operations where needed, and intermediate-state snapshots.
 #
 # These instructions specify the requested response format; they do not
 # guarantee a correct trace or predicted result.
-# ---------------------------------------------------------------------------
 
 COT_SYSTEM = """\
-You are a virtual runtime that traces Python function execution symbolically.
+You are a virtual runtime that predicts a Python function's return value
+from its signature, docstring, and concrete inputs.
 
-Given a function's signature, docstring, and concrete inputs, trace the \
-execution as follows:
+The docstring describes the intended behavior. Implementation code is
+intentionally omitted. Apply the specified behavior to the supplied inputs.
+The absence of implementation code alone is not a reason to decline the task.
+Do not invent behavior that the specification does not state.
 
-- Sequential steps: evaluate each expression in order and record the result.
-- Branch (if/elif/else): evaluate the condition, state which branch is taken, \
-then continue inside that branch.
-- Loop (for/while): unroll each iteration one at a time, updating state \
-after each pass.
+Reason through the task step by step:
+- Apply the operations implied by the specified behavior in order.
+- Where a condition is required, evaluate it and explain its consequence.
+- Where repeated operations are required, work through the iterations,
+  updating the relevant intermediate values.
 
-After every meaningful step, record the current variable state:
+After every meaningful step, record the current state:
   State: {var1: value, var2: value, ...}
 
-On the final line, output only the predicted return value in a result object:
+On the final line, output the predicted return value in a result object:
   {"result": <value>}
 
-Do not write or execute code. Reason through the execution symbolically."""
+Do not write or execute code. Reason through the specified behavior symbolically."""
 
 # The worked example shows a trace, variable-state updates, and a final result.
 COT_FEWSHOT = """\
-# Trace format example
+BEGIN EXAMPLE 1
+Example task:
 Signature: gcd(a: int, b: int) -> int
 Docstring: Return the greatest common divisor of a and b using the Euclidean \
 algorithm.
 Inputs (Python values): {"a": 12, "b": 8}
 
+Example response:
 Sequential: start with the supplied inputs
   State: {a: 12, b: 8}
 Loop condition: b != 0 → True
@@ -177,7 +290,8 @@ Loop iteration 2: compute 8 mod 4 = 0; update (a, b) to (4, 0)
   State: {a: 4, b: 0}
 Loop condition: b != 0 → False — exit the loop
 Sequential: return a, which is 4
-{"result": 4}"""
+{"result": 4}
+END EXAMPLE 1"""
 
 
 def build_cot_prompt(
@@ -185,23 +299,21 @@ def build_cot_prompt(
     docstring: str,
     inputs: dict[str, Any],
     include_fewshot: bool = True,
+    *, answer_format: str = LEGACY,
 ) -> str:
-    """Build a structured-trace prompt, optionally including an example."""
+    """Build a specification-trace prompt, optionally including an example."""
     inputs_text = _format_prompt_value(inputs)
     user_block = (
         f"Signature: {signature}\n"
-        f"Docstring: {docstring}\n"
-        f"Inputs (Python values): {inputs_text}\n"
-        "\nTrace:"
+        f"Specification (docstring):\n{docstring}\n"
+        f"Inputs (Python values): {inputs_text}"
     )
-    parts = [COT_SYSTEM, RESULT_VALUE_FORMAT]
-    if include_fewshot:
-        parts.append(COT_FEWSHOT)
-    parts.append(user_block)
-    return "\n\n".join(parts)
+    return _build_prediction_prompt(
+        COT_SYSTEM, user_block, "Trace:",
+        COT_FEWSHOT if include_fewshot else None, answer_format,
+    )
 
 
-# ---------------------------------------------------------------------------
 # Pseudocode-then-simulate prompt
 #
 # Request a numbered plain-English procedure, followed by a simulation
@@ -210,7 +322,6 @@ def build_cot_prompt(
 # Both stages are requested in the same response. The strategy does not
 # execute the procedure, freeze it separately, or independently verify
 # that the simulation follows it.
-# ---------------------------------------------------------------------------
 
 PSEUDOCODE_SYSTEM = """\
 You are a virtual runtime. Given a Python function's signature, docstring, \
@@ -235,11 +346,13 @@ procedure produces."""
 
 # The worked example shows a procedure, simulated state updates, and a final result.
 PSEUDOCODE_FEWSHOT = """\
-# Output format example
+BEGIN EXAMPLE 1
+Example task:
 Signature: count_above(xs: list, t: int) -> int
 Docstring: Return how many items in xs are strictly greater than t.
 Inputs (Python values): {"xs": [3, 9, 4], "t": 4}
 
+Example response:
 Procedure:
   1. Set a counter to zero.
   2. For each item in xs, do step 3.
@@ -256,7 +369,8 @@ Step 3 with item 9: 9 greater than 4 is true — counter becomes 1
 Step 3 with item 4: 4 greater than 4 is false — counter unchanged
   State: {counter: 1, item: 4}
 Step 4: return counter
-{"result": 1}"""
+{"result": 1}
+END EXAMPLE 1"""
 
 
 def build_pseudocode_prompt(
@@ -264,23 +378,21 @@ def build_pseudocode_prompt(
     docstring: str,
     inputs: dict[str, Any],
     include_fewshot: bool = True,
+    *, answer_format: str = LEGACY,
 ) -> str:
     """Build a procedure-and-simulation prompt with optional examples."""
     inputs_text = _format_prompt_value(inputs)
     user_block = (
         f"Signature: {signature}\n"
-        f"Docstring: {docstring}\n"
-        f"Inputs (Python values): {inputs_text}\n"
-        "\nProcedure:"
+        f"Specification (docstring):\n{docstring}\n"
+        f"Inputs (Python values): {inputs_text}"
     )
-    parts = [PSEUDOCODE_SYSTEM, RESULT_VALUE_FORMAT]
-    if include_fewshot:
-        parts.append(PSEUDOCODE_FEWSHOT)
-    parts.append(user_block)
-    return "\n\n".join(parts)
+    return _build_prediction_prompt(
+        PSEUDOCODE_SYSTEM, user_block, "Procedure:",
+        PSEUDOCODE_FEWSHOT if include_fewshot else None, answer_format,
+    )
 
 
-# ---------------------------------------------------------------------------
 # Contract-check prompt (second stage of the contract strategy)
 #
 # Ask the model to assess a proposed candidate against the function's
@@ -288,7 +400,6 @@ def build_pseudocode_prompt(
 #
 # This is a model judgment, not a comparison with a reference implementation.
 # Neither acceptance nor revision establishes that the result is correct.
-# ---------------------------------------------------------------------------
 
 CONTRACT_CHECK_SYSTEM = """\
 You are checking a proposed result against a function's specification.
@@ -314,21 +425,27 @@ write or execute code."""
 
 # Examples show one accepted candidate and one revised candidate.
 CONTRACT_CHECK_FEWSHOT = """\
-# Output format examples
-
+BEGIN EXAMPLE 1
+Example task:
 Signature: add(a: int, b: int) -> int
 Docstring: Return the sum of a and b.
 Inputs (Python values): {"a": 2, "b": 3}
 Proposed result (Python value): 5
+Example response:
 Check: the docstring requires the sum; 2 + 3 is 5; the declared type is int.
 {"verdict": "accept", "result": 5}
+END EXAMPLE 1
 
+BEGIN EXAMPLE 2
+Example task:
 Signature: initials(name: str) -> str
 Docstring: Return the uppercase first letter of each word, separated by dots.
 Inputs (Python values): {"name": "ada lovelace"}
 Proposed result (Python value): "AL"
+Example response:
 Check: the docstring requires dot separation, which the proposed value omits.
-{"verdict": "revise", "result": "A.L"}"""
+{"verdict": "revise", "result": "A.L"}
+END EXAMPLE 2"""
 
 
 def build_contract_check_prompt(
@@ -337,25 +454,25 @@ def build_contract_check_prompt(
     inputs: dict[str, Any],
     candidate: Any,
     include_fewshot: bool = True,
+    *, answer_format: str = LEGACY,
 ) -> str:
     """Build a candidate-checking prompt, optionally including examples."""
     inputs_text = _format_prompt_value(inputs)
     candidate_text = _format_prompt_value(candidate)
     user_block = (
         f"Signature: {signature}\n"
-        f"Docstring: {docstring}\n"
+        f"Specification (docstring):\n{docstring}\n"
         f"Inputs (Python values): {inputs_text}\n"
-        f"Proposed result (Python value): {candidate_text}\n"
-        "Check:"
+        f"Unverified candidate return value (Python value): {candidate_text}\n"
+        "This is a proposed answer to check, not a verified reference answer."
     )
-    parts = [CONTRACT_CHECK_SYSTEM, RESULT_VALUE_FORMAT]
-    if include_fewshot:
-        parts.append(CONTRACT_CHECK_FEWSHOT)
-    parts.append(user_block)
-    return "\n\n".join(parts)
+    return _build_prediction_prompt(
+        CONTRACT_CHECK_SYSTEM, user_block, "Check:",
+        CONTRACT_CHECK_FEWSHOT if include_fewshot else None, answer_format,
+        verdict=True,
+    )
 
 
-# ---------------------------------------------------------------------------
 # Confidence prompt (model-selected visible tracing)
 #
 # Ask the model to choose between answering directly and providing a
@@ -363,7 +480,6 @@ def build_contract_check_prompt(
 #
 # The strategy does not measure confidence or apply a routing threshold.
 # This response-format choice is separate from the backend thinking setting.
-# ---------------------------------------------------------------------------
 
 CONFIDENCE_SYSTEM = """\
 You are a virtual runtime. Given a Python function's signature, docstring, \
@@ -413,6 +529,7 @@ def build_confidence_prompt(
     docstring: str,
     inputs: dict[str, Any],
     include_fewshot: bool = True,
+    *, answer_format: str = LEGACY,
 ) -> str:
     """Build a model-selected tracing prompt with optional examples."""
     inputs_text = _format_prompt_value(inputs)
@@ -422,6 +539,15 @@ def build_confidence_prompt(
         f"Inputs (Python values): {inputs_text}\n"
         "Output:"
     )
+    validate_answer_format(answer_format)
+    if answer_format in (FRAMED_V1, FRAMED_TEXT_V1):
+        return _build_prediction_prompt(
+            CONFIDENCE_SYSTEM.replace('on its own line:', 'inside the final-answer block:'),
+            user_block, "Answer:",
+            CONFIDENCE_FEWSHOT.replace('Output: {"result": 5}', 'Output:\n{"result": 5}')
+            if include_fewshot else None,
+            answer_format,
+        )
     parts = [CONFIDENCE_SYSTEM, RESULT_VALUE_FORMAT]
     if include_fewshot:
         parts.append(CONFIDENCE_FEWSHOT)
@@ -429,55 +555,27 @@ def build_confidence_prompt(
     return "\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Code-generation prompt for the comparison baseline
-#
-# Request a Python function body from the signature and docstring.
-# The benchmark baseline assembles and executes the generated code;
-# this module only constructs the prompt.
-# ---------------------------------------------------------------------------
-
-CODEGEN_SYSTEM = """\
-You are a Python code generator. Given a function signature and docstring, \
-write a complete Python function implementation. Output only the function \
-body (do not repeat the def line). No explanations, no tests, no markdown \
-fences. The code must be valid Python that can be indented under the def line."""
-
-
-def build_codegen_prompt(
-    signature: str,
-    docstring: str,
-) -> str:
-    """Build a function-body prompt with the specification as a Python string literal."""
-    # Keep this list aligned with code_gen_baseline._ALLOWED_MODULES.
-    environment = (
-        "The following modules are already available as globals: "
-        "math, json, re, itertools, functools, collections, string, statistics. "
-        "Use them directly, or import from these modules. Imports of other "
-        "module roots are not allowed."
-    )
-    user_block = (
-        f"def {signature}:\n"
-        f"    {docstring!r}\n"
-        "    # Implementation:"
-    )
-    return f"{CODEGEN_SYSTEM}\n\n{environment}\n\n{user_block}"
-
-
-# ---------------------------------------------------------------------------
 # Validation-retry prompt
 #
 # Append the previous response and validation feedback to the original
 # prompt, followed by a request for a corrected result-key object.
-# ---------------------------------------------------------------------------
 
 
 def build_retry_prompt(
     original_prompt: str,
     raw_output: str,
     error_message: str,
+    *, answer_format: str = LEGACY,
 ) -> str:
     """Append a previous response and validation feedback to a prompt."""
+    validate_answer_format(answer_format)
+    if answer_format in (FRAMED_V1, FRAMED_TEXT_V1):
+        return (
+            f"{original_prompt}\n\nPrevious output:\n{raw_output}\n\n"
+            f"Validation error: {error_message}\n"
+            "Return the corrected complete result object in one final-answer block.\n"
+            f"{RESULT_VALUE_FORMAT}\n{FRAMED_VALUE_RULES}"
+        )
     return (
         f"{original_prompt}\n\n"
         f"Previous output:\n{raw_output}\n\n"

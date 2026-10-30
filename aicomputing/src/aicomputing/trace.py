@@ -1,28 +1,10 @@
-"""
-Tracing module for AI Computing.
+"""Append invocation evidence as JSONL; write failures warn without stopping predictions.
 
-Appends runtime-submitted records to a JSONL file for debugging and analysis.
-Serialization and file errors produce warnings without interrupting predictions.
-Each line contains request details, recorded response text, a recovered value,
-and selected diagnostics.
+Cache hits record cached=true and zero tokens. Token counts for uncached calls
+use legacy strategy accounting and may omit earlier attempts. Reasoning requests
+preserve response order but do not establish the model's actual reasoning mode.
 
-Cache hits are recorded with "cached": true and tokens_used set to zero.
-Records describe invocations, not individual model calls. Reasoning-request
-records preserve the native settings reported for responses in call order;
-they do not establish the provider's actual reasoning mode. Uncached token
-counts currently use the legacy strategy-reported value and may exclude
-usage from earlier attempts.
-
-Usage:
-    from aicomputing import VirtualRuntime
-
-    vr = VirtualRuntime(
-        backend="ollama",
-        model="qwen3:4b",
-        trace_file="trace.jsonl",
-    )
-    # Execute requests through vr.
-    # trace.jsonl receives records when the runtime calls the tracer.
+Enable with VirtualRuntime(trace_file="trace.jsonl").
 """
 
 from __future__ import annotations
@@ -65,12 +47,13 @@ class Tracer:
         revised: Optional[bool] = None,
         pre_revision_value: Any = None,
         provider_finish_reason: Optional[str] = None,
-        exec_status: Optional[str] = None,
         prompts: Optional[List[str]] = None,
         input_warnings: Optional[List[str]] = None,
         type_warnings: Optional[List[str]] = None,
         constraint_warnings: Optional[List[str]] = None,
         reasoning_observations: Optional[List[Optional[Dict[str, Any]]]] = None,
+        answer_format: str = "legacy",
+        transport_diagnostics: Optional[List[Optional[Dict[str, Any]]]] = None,
     ) -> None:
         # Protect record numbering and writing through this tracer instance.
         with self._lock:
@@ -92,11 +75,12 @@ class Tracer:
                     "revised": revised,
                     "pre_revision_value": _safe_serialize(pre_revision_value),
                     "provider_finish_reason": provider_finish_reason,
-                    "exec_status": exec_status,
                     # Strategy-recorded prompts supplied by the runtime.
                     "prompts": prompts or [],
                     "reasoning_requests": _safe_serialize(reasoning_requests),
                     "reasoning_observations": _safe_serialize(reasoning_observations),
+                    "answer_format": answer_format,
+                    "transport_diagnostics": _safe_serialize(transport_diagnostics),
                     "latency_ms": round(latency_ms, 1),
                     # Legacy strategy-reported token count.
                     "tokens_used": tokens_used,

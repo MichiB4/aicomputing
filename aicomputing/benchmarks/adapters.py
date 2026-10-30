@@ -1,19 +1,9 @@
-"""
-Benchmark adapters: manifest entry -> executable specification + ground truth.
+"""Resolve manifest selections into specifications, inputs, and grading targets.
 
-Each adapter turns the IDs recorded in the experiment manifest back into the
-three things the virtual runtime needs (signature, docstring, inputs) plus the
-expected value, and supplies the comparison used to score the answer.
-
-Comparison functions reuse the legacy benchmark graders. End-to-end scoring
-also depends on parsing, validation and failure handling in the runtime and
-runner; sharing a comparison function alone does not establish historical
-result comparability.
-
-Generalization specification text is declared here. Core benchmark signatures
-and docstrings come from the EvalPlus loaders. Selected specifications, inputs
-and expected outputs are covered by the manifest's content fingerprints.
-"""
+Models receive only specifications and inputs. Ground truth remains grading data.
+Shared comparison functions do not guarantee historical comparability: parsing,
+validation, and failure handling also affect end-to-end scores.
+Content fingerprints cover the selected specification, input, and target."""
 
 from __future__ import annotations
 
@@ -24,17 +14,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from aicomputing.types import parse_signature
 
-from experiment import BENCHMARK_GROUP, manifest_items
+from benchmark_metadata import BENCHMARK_GROUP, manifest_items
 
 
 @dataclass
 class ResolvedItem:
-    """One selected observation with execution inputs and grading metadata.
-
-    The runner sends signature, docstring, inputs and an optional return-type
-    override to the runtime. The expected value is retained for grading.
-    Remaining fields identify the observation and its recorded sources.
-    """
+    """One selected invocation, its specification, and grading/provenance metadata."""
     item_id: str
     signature: str
     docstring: str
@@ -46,6 +31,7 @@ class ResolvedItem:
     input_line: str = ""
     invocation_pool: Optional[str] = None  # Source label, e.g. base or plus; None if unavailable.
     return_type_source: str = "signature"    # "signature" | "none"
+    scoring_profile: Optional[str] = None  # Frozen prepared-release grading rule.
 
 
 @dataclass
@@ -59,14 +45,49 @@ class Adapter:
     def group(self) -> str:
         return BENCHMARK_GROUP[self.name]
 
+    def score(self, predicted, item: ResolvedItem) -> bool:
+        if item.scoring_profile is not None:
+            from prepared_data import compare_prepared
+            return compare_prepared(predicted, item.expected, item.scoring_profile)
+        return self.compare(predicted, item.expected)
 
-# ---------------------------------------------------------------------------
+
+def _resolve_prepared(manifest, benchmark):
+    from mbpp_ground_truth import decode_value
+    from prepared_data import approved_items, release_for_manifest
+    data = release_for_manifest(manifest)
+    available = {item["item_id"]: item for item in approved_items(data, benchmark)}
+    out, seen = [], set()
+    for entry in manifest_items(manifest, benchmark):
+        item_id = entry["item_id"]
+        if item_id in seen:
+            raise ValueError(f"{benchmark}: duplicate selected item ID {item_id}")
+        seen.add(item_id)
+        if item_id not in available:
+            raise ValueError(f"{item_id}: task is not approved in the frozen release")
+        task = available[item_id]
+        observations = {value["invocation_id"]: value for value in task["observations"]}
+        if entry.get("invocation_id") not in observations:
+            raise ValueError(f"{item_id}: invocation is not approved in the frozen release")
+        value = observations[entry["invocation_id"]]
+        annotation = parse_signature(task["signature"]).return_annotation
+        out.append(ResolvedItem(
+            item_id=item_id, signature=task["signature"], docstring=task["specification"],
+            inputs=decode_value(value["inputs"]), expected=decode_value(value["expected"]),
+            invocation_id=value["invocation_id"], invocation_pool=value.get("pool"),
+            input_line=value.get("input_line", ""), scoring_profile=task["scoring_profile"],
+            return_type_source="signature" if annotation is not None else "none",
+        ))
+    return out
+
+
 # HumanEval+ / MBPP+  (core)
-# ---------------------------------------------------------------------------
 
 def _resolve_evalplus(benchmark: str) -> Callable[[Dict[str, Any]], List[ResolvedItem]]:
     """Build a resolver using recorded IDs and specification-only return typing."""
     def resolve(manifest: Dict[str, Any]) -> List[ResolvedItem]:
+        if manifest.get("data_policy") == "reviewed_release_v1":
+            return _resolve_prepared(manifest, benchmark)
         from evalplus_data import LOADERS
 
         items = {}
@@ -118,13 +139,11 @@ def _resolve_evalplus(benchmark: str) -> Callable[[Dict[str, Any]], List[Resolve
 
 
 def _compare_values(predicted: Any, expected: Any) -> bool:
-    from humaneval_oracle import results_match
+    from scoring import results_match
     return results_match(predicted, expected)
 
 
-# ---------------------------------------------------------------------------
 # GSM8K  (generalization: numerical reasoning)
-# ---------------------------------------------------------------------------
 
 GSM8K_SIGNATURE = "solve_math(question: str) -> float"
 GSM8K_DOCSTRING = ("Solve the given grade school math word problem. "
@@ -132,8 +151,10 @@ GSM8K_DOCSTRING = ("Solve the given grade school math word problem. "
 
 
 def _resolve_gsm8k(manifest: Dict[str, Any]) -> List[ResolvedItem]:
+    if manifest.get("data_policy") == "reviewed_release_v1":
+        return _resolve_prepared(manifest, "gsm8k")
     from datasets import load_dataset
-    from gsm8k_oracle import extract_gsm8k_answer
+    from scoring import extract_gsm8k_answer
     ds = load_dataset("openai/gsm8k", "main", split="test")
     out: List[ResolvedItem] = []
     for entry in manifest_items(manifest, "gsm8k"):
@@ -160,56 +181,14 @@ def _resolve_gsm8k(manifest: Dict[str, Any]) -> List[ResolvedItem]:
 
 
 def _compare_gsm8k(predicted: Any, expected: Any) -> bool:
-    from gsm8k_oracle import answers_match
+    from scoring import answers_match
     return answers_match(predicted, expected)
-
-
-# ---------------------------------------------------------------------------
-# BBH  (generalization: symbolic / logical reasoning)
-# ---------------------------------------------------------------------------
-
-def _resolve_bbh(manifest: Dict[str, Any]) -> List[ResolvedItem]:
-    from datasets import load_dataset
-    from bbh_oracle import TASK_SPECS
-    cache: Dict[str, Any] = {}
-    out: List[ResolvedItem] = []
-    for entry in manifest_items(manifest, "bbh"):
-        task, idx = entry["item_id"].rsplit("/", 1)
-        if task not in cache:
-            cache[task] = load_dataset("lukaemon/bbh", task, split="test")
-        row = cache[task][int(idx)]
-        spec = TASK_SPECS[task]
-        # The parameter name is read from the declared signature rather than
-        # hardcoded to "question". Passing {"question": ...} against a
-        # signature declaring `expression` made the specification internally
-        # inconsistent: harmless for the spec-only arms, which only render the
-        # inputs into a prompt, but a hard TypeError for the code-generation
-        # baseline, which actually calls the function.
-        param = spec["signature"].split("(", 1)[1].split(":", 1)[0].strip()
-        out.append(ResolvedItem(
-            item_id=entry["item_id"],
-            signature=spec["signature"],
-            docstring=spec["docstring"],
-            inputs={param: row["input"]},
-            expected=row["target"],
-            return_type=str,
-            category=entry.get("category", task),
-            input_line=row["input"][:120],
-        ))
-    return out
-
-
-def _compare_bbh(predicted: Any, expected: Any) -> bool:
-    from bbh_oracle import normalize_answer
-    pred = "" if predicted is None else str(predicted)
-    return normalize_answer(pred) == normalize_answer(str(expected))
 
 
 ADAPTERS: Dict[str, Adapter] = {
     "humaneval_plus": Adapter("humaneval_plus", _resolve_evalplus("humaneval_plus"), _compare_values),
     "mbpp_plus": Adapter("mbpp_plus", _resolve_evalplus("mbpp_plus"), _compare_values),
     "gsm8k": Adapter("gsm8k", _resolve_gsm8k, _compare_gsm8k),
-    "bbh": Adapter("bbh", _resolve_bbh, _compare_bbh),
 }
 
 

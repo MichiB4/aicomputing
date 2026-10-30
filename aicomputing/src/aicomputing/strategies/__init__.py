@@ -37,31 +37,17 @@ _REGISTRY: dict[str, type[Strategy]] = {
     "hybrid": HybridStrategy,
 }
 
-# Registered strategies excluded from the default evaluation subset
-# returned by list_arms(). Both remain available through create_strategy()
-# and are included in list_strategies().
-#
-# Hybrid routes requests to direct or CoT using fixed heuristics.
-# Consistency makes repeated CoT predictions and votes among eligible answers.
-#
-# These exclusions define experiment scope, not runtime support.
+# Excluded from default evaluation arms, but available through the registry.
 _NON_ARM = frozenset({"hybrid", "consistency"})
 
 
 def list_strategies() -> list[str]:
-    """Return all registered strategy names in registry order.
-
-    Includes strategies excluded from the default evaluation subset.
-    """
+    """Return all registered strategy names in registry order."""
     return list(_REGISTRY)
 
 
 def list_arms() -> list[str]:
-    """Return default evaluation strategy names in registry order.
-
-    Exclude names in _NON_ARM. Excluded strategies remain available
-    through create_strategy() and are included in list_strategies().
-    """
+    """Return registered strategy names except _NON_ARM, preserving order."""
     return [name for name in _REGISTRY if name not in _NON_ARM]
 
 

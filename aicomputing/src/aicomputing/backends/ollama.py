@@ -1,19 +1,10 @@
-"""
-Ollama backend for AI Computing.
+"""Ollama chat backend with optional native think control.
 
-Talks to an Ollama server using chat requests. An optional backend-level
-think setting is sent as a native request field; omission uses the model
-default. Support and interpretation depend on the SDK, server and model.
+Omitting think uses the model default; SDK, server and model determine support.
 Recorded settings describe requests, not proof of their effect.
 
-None removes the application output-token cap using num_predict=-1.
-Explicit positive token allowances are passed through unchanged.
-Retry-on-cutoff for explicit allowances is handled by the strategy layer.
-
-finish_reason is "stop" for a clean completion, "length" if the model hit
-the token limit before finishing.
-
-Explicit native controls require compatible SDK, server and model support.
+None sends num_predict=-1; positive token allowances pass through unchanged.
+The strategy layer handles truncation retries using normalized finish reasons.
 """
 
 from __future__ import annotations
@@ -56,6 +47,7 @@ class OllamaBackend(Backend):
         self._default_model = model
         self._host = host
         self._client = None
+        self._owns_client = False
 
     reasoning_parameter = "think"
     _reasoning_value_types = (bool, str)
@@ -145,9 +137,23 @@ class OllamaBackend(Backend):
             import ollama as _ollama
             if self._host:
                 self._client = _ollama.Client(host=self._host)
+                self._owns_client = True
             else:
                 self._client = _ollama
         return self._client
+
+    def close(self) -> None:
+        """Close owned transport; shared SDK clients stay open.
+
+        Cleanup is lazy and repeatable. Later generation reacquires a client.
+        Do not close during generation.
+        """
+        if self._owns_client:
+            # Ollama's synchronous Client stores its HTTPX transport here;
+            # the SDK does not expose a public close method.
+            self._client._client.close()
+        self._client = None
+        self._owns_client = False
 
     @property
     def name(self) -> str:
@@ -253,8 +259,6 @@ class OllamaBackend(Backend):
         msg = _get_field(response, "message", {})
         raw_text = _get_field(msg, "content", "")
         tokens = _get_field(response, "eval_count", None)
-        # Shared normalisation so every backend maps onto {"stop", "length"}
-        # identically and unknown values are surfaced rather than swallowed.
         provider_finish_reason = _get_field(response, "done_reason", None)
         finish_reason = normalize_finish_reason(provider_finish_reason, mdl)
         thinking = _get_field(msg, "thinking", None)
@@ -289,10 +293,6 @@ class OllamaBackend(Backend):
         except Exception:
             return False
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _get_field(obj: Any, field: str, default: Any = None) -> Any:
     """Get a field from a Pydantic object or dict."""

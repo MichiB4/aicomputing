@@ -1,31 +1,11 @@
-"""
-Shared argument parsing and runtime construction for benchmark scripts.
+"""Shared benchmark CLI arguments, connection presets, and runtime construction.
 
-Provider presets supply default connection settings. The prompting strategy
-defaults to direct, independently of the model name and native reasoning.
+Prompting defaults to direct, independently of native reasoning. Native overrides
+apply only to their backend; omission leaves provider defaults unchanged.
+Requested settings do not prove their effect.
 
-Native reasoning overrides are explicit backend settings. Omitting them leaves
-backend defaults unchanged; requesting them does not prove the model uses them.
-
-Usage in a benchmark script::
-
-    import argparse
-    from bench_args import (
-        add_common_args, build_runtime, configure_system_certificates, resolve_args,
-    )
-
-    # In the application entry point, before importing HTTPS clients:
-    configure_system_certificates()
-
-    ap = argparse.ArgumentParser()
-    add_common_args(ap)
-    ap.add_argument("--limit", type=int, default=None)
-    cfg = resolve_args(ap.parse_args())
-    vr = build_runtime(cfg)
-
-The shared builder applies trace configuration and the optional code-generation
-baseline. Native reasoning settings reach the backend through cfg.backend_kwargs.
-"""
+Call configure_system_certificates() at application startup before HTTPS imports.
+build_runtime() applies tracing and the selected oracle strategy."""
 
 from __future__ import annotations
 
@@ -44,7 +24,6 @@ from aicomputing import VirtualRuntime
 from aicomputing.model_config import (
     get_provider_preset,
     list_providers,
-    PROVIDER_PRESETS,
 )
 from aicomputing.backends.base import BackendCommunicationError, BackendTimeoutError
 from aicomputing.request import ExecuteResult, FailureType
@@ -59,11 +38,6 @@ class BenchConfig:
     backend_kwargs: Dict[str, Any] = field(default_factory=dict)
     trace: Optional[str] = None
     max_tokens: Optional[int] = None
-    # True when --baseline was passed: run the code-generation baseline
-    # instead of a spec-only strategy. Kept as a separate flag rather than a
-    # registry entry because the baseline generates and executes code, which
-    # every strategy is forbidden to do — see build_runtime().
-    baseline: bool = False
 
 
 def configure_system_certificates() -> None:
@@ -78,25 +52,9 @@ def configure_system_certificates() -> None:
 
 
 def add_common_args(ap: argparse.ArgumentParser) -> None:
-    """Register shared benchmark command-line options.
+    """Register provider, connection, strategy, generation, and native-control options.
 
-    --provider       Supply default connection settings from a named preset.
-                     Explicit backend and URL options take precedence.
-    --backend        Backend name; defaults to ollama without a provider.
-    --model          Model identifier, resolved from the preset or fallback.
-    --base-url       API URL, or Ollama host (a trailing /v1 is removed).
-    --api-key        Explicit key; named providers also support environment keys.
-    --strategy       Registered prompting strategy; defaults to direct.
-    --baseline       Run code generation and execution instead of a prompt strategy.
-    --reasoning-effort  OpenAI-compatible native effort string.
-    --ollama-think    Ollama true/false or a model-specific level string.
-    --hf-thinking / --no-hf-thinking  HF chat-template Boolean override.
-    --trace          JSONL trace destination.
-    --max-tokens     Optional starting allowance; omitted means no application cap.
-
-    Native reasoning options are omitted by default and apply independently of
-    the prompting strategy. Options for a different backend are rejected.
-    """
+    Reasoning controls are omitted by default and rejected for other backends."""
     provider_choices = list_providers()
     ap.add_argument(
         "--provider",
@@ -136,16 +94,6 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         ),
     )
     ap.add_argument(
-        "--baseline", action="store_true",
-        # Keep help text compatible with consoles using limited encodings.
-        help=(
-            "Run the code-generation baseline instead of a spec-only strategy: "
-            "generate an implementation, execute it, return the real output. "
-            "Overrides --strategy. Generated-program failures count as wrong; "
-            "provider and harness failures are excluded from accuracy scoring."
-        ),
-    )
-    ap.add_argument(
         "--reasoning-effort", default=None,
         help="OpenAI-compatible reasoning_effort value; omitted by default.",
     )
@@ -163,11 +111,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
 
 
 def resolve_args(args: argparse.Namespace) -> BenchConfig:
-    """Resolve presets and explicit options into a benchmark configuration.
-
-    Prompting defaults to direct. Native reasoning overrides are passed only
-    to their matching backend, without inferring the model's reasoning mode.
-    """
+    """Resolve presets and CLI options; default to direct without inferring reasoning."""
     if args.max_tokens is not None and args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive")
 
@@ -180,7 +124,7 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
     if not api_key and args.provider:
         api_key = os.environ.get(_PROVIDER_ENV_KEYS.get(args.provider.lower(), ""))
 
-    # --- 1. Apply provider preset ---
+    # 1. Apply provider preset
     if args.provider:
         preset = get_provider_preset(args.provider)
         if preset:
@@ -200,7 +144,7 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
                 print("[bench_args] Please specify --model explicitly.")
                 sys.exit(1)
 
-    # --- 2. Final defaults ---
+    # 2. Final defaults
     if not backend:
         backend = "ollama"
     if not model:
@@ -209,15 +153,8 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
         model = "qwen3:4b-instruct"
         print(f"[bench_args] No model specified — using default '{model}'")
 
-    # --- 3. Select the prompting strategy independently of native reasoning ---
-    strategy = args.strategy
-    if getattr(args, "baseline", False):
-        # The baseline generates and executes code; it is a separate condition.
-        if strategy is not None:
-            print(f"[bench_args] --baseline overrides --strategy {strategy}")
-        strategy = BASELINE_NAME
-    elif strategy is None:
-        strategy = "direct"
+    # 3. Select the prompting strategy independently of native reasoning
+    strategy = args.strategy or "direct"
 
     # Reject connection settings unsupported by the selected adapter.
     if backend == "hf" and (base_url or api_key):
@@ -225,7 +162,7 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
     if backend == "ollama" and api_key:
         raise ValueError("This Ollama adapter does not accept an API key")
 
-    # --- 4. Build backend kwargs ---
+    # 4. Build backend kwargs
     backend_kwargs: Dict[str, Any] = {}
     if base_url:
         if backend == "ollama":
@@ -278,7 +215,6 @@ def resolve_args(args: argparse.Namespace) -> BenchConfig:
         backend_kwargs=backend_kwargs,
         trace=args.trace,
         max_tokens=args.max_tokens,
-        baseline=getattr(args, "baseline", False),
     )
 
 
@@ -290,31 +226,13 @@ _PROVIDER_ENV_KEYS = {
     "sambanova": "SAMBANOVA_API_KEY",
 }
 
-# Strategy name reported for the code-generation baseline.
-BASELINE_NAME = "code_gen_baseline"
-
-
 def build_runtime(cfg: BenchConfig):
-    """Construct a benchmark runtime from resolved configuration.
-
-    The code-generation baseline is imported only when selected and supplied
-    as an instance, keeping it outside the prediction-strategy registry.
-    Starting token budgets are supplied separately on execution requests.
-    """
-    strategy: Any = cfg.strategy
-    if cfg.baseline:
-        try:
-            from baselines.code_gen_baseline import CodeGenBaseline
-        except ModuleNotFoundError as exc:
-            if exc.name not in {"baselines", "baselines.code_gen_baseline"}:
-                raise
-            from benchmarks.baselines.code_gen_baseline import CodeGenBaseline
-        strategy = CodeGenBaseline()
+    """Build the oracle runtime; token allowances belong to execution requests."""
 
     return VirtualRuntime(
         backend=cfg.backend,
         model=cfg.model,
-        strategy=strategy,
+        strategy=cfg.strategy,
         trace_file=cfg.trace,
         **cfg.backend_kwargs,
     )
@@ -351,15 +269,6 @@ def execute_resilient(vr, req, *, label: str = "") -> Any:
             latency_ms=(time.perf_counter() - started) * 1000.0,
             tokens_used=0,
             token_retries=0,
+            answer_format=getattr(req, "answer_format", "legacy"),
+            transport_diagnostics=[exc.diagnostics] if getattr(exc, "diagnostics", None) is not None else [],
         )
-
-
-def print_provider_table() -> None:
-    """Print configured provider presets and their example model IDs."""
-    print("Provider presets (--provider):")
-    print()
-    for name, preset in PROVIDER_PRESETS.items():
-        print(f"  {name:<12} {preset['notes']}")
-        for model in preset["models"]:
-            print(f"               - {model}")
-    print()

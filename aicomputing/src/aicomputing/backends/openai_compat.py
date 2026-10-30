@@ -1,18 +1,9 @@
-"""OpenAI-compatible chat-completions backend for AI Computing.
+"""OpenAI-compatible chat backend with configurable endpoint and model.
 
-Uses the optional OpenAI client with a configurable endpoint and model.
-Compatibility depends on the server's implementation of the API.
-
-None omits the output-token limit; provider defaults and model capacities
-still apply. Explicit positive allowances are sent as max_tokens.
-
-Native reasoning uses an optional backend-level reasoning_effort setting.
-When configured, its literal value is sent to the provider; otherwise the
-parameter is omitted. Support and interpretation depend on the endpoint
-and model. A successful request does not prove the setting was honored.
-No model-name-based controls or prompt directives are added.
-
-Response text passes through strip_thinking() before being returned.
+None omits the token cap; positive allowances use max_tokens. Provider limits apply.
+Optional reasoning_effort is sent literally; endpoint/model support determines
+its effect. No model-name inference or reasoning directives are added.
+Returned text has leading thinking blocks stripped.
 
 Install: pip install aicomputing[openai]
 """
@@ -20,11 +11,16 @@ Install: pip install aicomputing[openai]
 from __future__ import annotations
 
 import os
+import math
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Any, Dict, List, Optional
 
 from ..model_config import DEFAULT_MAX_NEW_TOKENS
 from ..request import validate_generation_limits
 from ._text_utils import strip_thinking
+from .diagnostics import exception_diagnostics, safe_request_id
 from .base import (
     Backend,
     BackendCommunicationError,
@@ -47,6 +43,9 @@ class OpenAICompatBackend(Backend):
         allow_tool_use: bool = False,
         *,
         reasoning_effort: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+        sdk_max_retries: Optional[int] = None,
+        request_diagnostics: bool = False,
     ) -> None:
         if reasoning_effort is not None:
             if not isinstance(reasoning_effort, str):
@@ -54,13 +53,23 @@ class OpenAICompatBackend(Backend):
             if not reasoning_effort.strip():
                 raise ValueError("reasoning_effort must not be empty")
 
+        if timeout_seconds is not None and (
+            type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be finite and positive, or None")
+        if sdk_max_retries is not None and (type(sdk_max_retries) is not int or sdk_max_retries < 0):
+            raise ValueError("sdk_max_retries must be a nonnegative integer or None")
+        if type(request_diagnostics) is not bool:
+            raise TypeError("request_diagnostics must be a boolean")
+        self._timeout_seconds = timeout_seconds
+        self._sdk_max_retries = sdk_max_retries
+        self._request_diagnostics = request_diagnostics
         self._reasoning_effort = reasoning_effort
         self._model_name = model
         self._base_url = base_url
         self._api_key = api_key
         self._client = None
-        # When True, skip rejection of responses with tool-use indicators.
-        # This flag does not execute tools or enable them in requests.
+        # Bypasses the response guard; does not enable or execute tools.
         self._allow_tool_use = allow_tool_use
 
     reasoning_parameter = "reasoning_effort"
@@ -77,10 +86,7 @@ class OpenAICompatBackend(Backend):
         endpoint = "https://api.openai.com/v1" if endpoint is None else endpoint
         return str(httpx.URL(endpoint)).rstrip("/")
 
-    # Maximum additional SDK attempts for retryable request failures.
-    # Two retries allow up to three HTTP attempts per SDK request.
-    # The SDK handles retry eligibility and waiting.
-    # Separate from strategy truncation and validation retries.
+    # SDK retries are separate from strategy and validation retries.
     _MAX_RETRIES = 2
 
     def _get_client(self):
@@ -89,12 +95,26 @@ class OpenAICompatBackend(Backend):
             from openai import OpenAI
 
             kwargs: Dict[str, Any] = {"max_retries": self._MAX_RETRIES}
+            if self._sdk_max_retries is not None:
+                kwargs["max_retries"] = self._sdk_max_retries
+            if self._timeout_seconds is not None:
+                kwargs["timeout"] = self._timeout_seconds
             if self._base_url:
                 kwargs["base_url"] = self._base_url
             if self._api_key:
                 kwargs["api_key"] = self._api_key
             self._client = OpenAI(**kwargs)
         return self._client
+
+    def close(self) -> None:
+        """Close an initialized client; later generation recreates it.
+
+        On failure, retain the client for another cleanup attempt.
+        Do not close during generation.
+        """
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     @property
     def name(self) -> str:
@@ -114,6 +134,9 @@ class OpenAICompatBackend(Backend):
             "default_model": self._model_name,
             "reasoning_effort": self._reasoning_effort,
             "allow_tool_use": self._allow_tool_use,
+            "timeout_seconds": self._timeout_seconds,
+            "sdk_max_retries": self._sdk_max_retries,
+            "request_diagnostics": self._request_diagnostics,
         }
 
     def generate(
@@ -167,6 +190,18 @@ class OpenAICompatBackend(Backend):
         # Keep this optional SDK import local to the backend operation.
         from openai import APIError, APITimeoutError
 
+        diagnostics = None
+        if self._request_diagnostics:
+            client_id = str(uuid4())
+            api_kwargs["extra_headers"] = {"X-Client-Request-Id": client_id}
+            diagnostics = {
+                "client_request_id": client_id,
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "http_phase_timeout_seconds": self._timeout_seconds,
+                "timeout_is_total_request_deadline": False,
+                "sdk_max_retries": self._MAX_RETRIES if self._sdk_max_retries is None else self._sdk_max_retries,
+            }
+        started = time.monotonic()
         try:
             response = client.chat.completions.create(
                 model=mdl,
@@ -176,16 +211,22 @@ class OpenAICompatBackend(Backend):
                 **api_kwargs,
             )
         except APITimeoutError as exc:
-            raise BackendTimeoutError(f"{type(exc).__name__}: {exc}") from exc
+            if diagnostics is not None:
+                diagnostics.update(elapsed_seconds=time.monotonic() - started, **exception_diagnostics(exc))
+            raise BackendTimeoutError(f"{type(exc).__name__}: {exc}", diagnostics=diagnostics) from exc
         except APIError as exc:
-            raise BackendCommunicationError(f"{type(exc).__name__}: {exc}") from exc
+            if diagnostics is not None:
+                diagnostics.update(elapsed_seconds=time.monotonic() - started, **exception_diagnostics(exc))
+            raise BackendCommunicationError(f"{type(exc).__name__}: {exc}", diagnostics=diagnostics) from exc
 
+        if diagnostics is not None:
+            diagnostics.update(elapsed_seconds=time.monotonic() - started,
+                               provider_request_id=safe_request_id(getattr(response, "_request_id", None)))
 
         choice = response.choices[0]
         raw_dump = response.model_dump() if hasattr(response, "model_dump") else None
 
-        # Check tool-use indicators before missing text becomes a parse failure.
-        # A tool-call response may have no text content.
+        # Reject tool indicators before missing text becomes a parse failure.
         if not self._allow_tool_use:
             evidence = detect_tool_use(choice, raw_dump)
             if evidence is not None:
@@ -204,8 +245,6 @@ class OpenAICompatBackend(Backend):
             input_tokens = getattr(usage, "prompt_tokens", None)
             output_tokens = getattr(usage, "completion_tokens", None)
 
-        # Preserve the provider's original reason alongside the normalized value.
-        # Strategies use "length" to retry with a larger token budget.
         provider_finish_reason = getattr(choice, "finish_reason", None)
         finish_reason = normalize_finish_reason(provider_finish_reason, mdl)
 
@@ -226,6 +265,7 @@ class OpenAICompatBackend(Backend):
                 str(provider_finish_reason) if provider_finish_reason is not None else None
             ),
             raw=raw_dump,
+            transport_diagnostics=diagnostics,
         )
 
     def is_available(self) -> bool:

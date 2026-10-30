@@ -1,21 +1,9 @@
-"""
-Manifest-driven experiment configuration, item pools and reproducibility checks.
+"""Build and verify frozen experiment selections and settings.
 
-build_manifest() selects item IDs and invocation IDs once. The manifest-driven
-runner resolves and evaluates those entries; legacy oracle scripts retain
-separate sampling paths.
-
-Results are reported per benchmark. benchmark_group distinguishes the core
-specification-execution benchmarks from generalization benchmarks. The
-code-generation comparison is restricted to the core benchmarks.
-
-GSM8K and BBH use positional IDs, whose meaning depends on dataset contents and
-ordering. check_pools() compares ID-pool fingerprints; it cannot detect every
-content change. verify_content() compares fingerprints of selected resolved
-specifications, inputs and expected outputs.
-
-Manifest format and selection compatibility are versioned separately.
-"""
+Pool fingerprints detect ID changes. Content fingerprints also cover resolved
+specifications, inputs, targets, and categories, including positional GSM8K
+IDs whose meaning depends on dataset ordering. Manifest format and selection
+compatibility are versioned separately."""
 
 from __future__ import annotations
 
@@ -30,69 +18,24 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from aicomputing.model_config import get_provider_preset
 from aicomputing.request import validate_generation_limits
+from aicomputing.answer_protocol import LEGACY, validate_answer_format
+
+from benchmark_metadata import (
+    ALL_BENCHMARKS,
+    BENCHMARK_GROUP,
+    manifest_items,
+)
 
 from selection import (
     SELECTION_ALGORITHM_VERSION,
     derive_index,
     select_items,
-    select_stratified,
 )
 
-# Version 2 separates prompting strategies from backend-native reasoning settings.
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 # Default seed for manifest construction.
 DEFAULT_SEED = 42
-
-CORE_BENCHMARKS = ("humaneval_plus", "mbpp_plus")
-GENERALIZATION_BENCHMARKS = ("gsm8k", "bbh")
-ALL_BENCHMARKS = CORE_BENCHMARKS + GENERALIZATION_BENCHMARKS
-
-BENCHMARK_GROUP: Dict[str, str] = {
-    **{b: "core" for b in CORE_BENCHMARKS},
-    **{b: "generalization" for b in GENERALIZATION_BENCHMARKS},
-}
-
-# This experiment includes the code-generation baseline for core benchmarks.
-# The runner rejects baseline runs on the generalization benchmarks.
-BASELINE_BENCHMARKS = frozenset(CORE_BENCHMARKS)
-BASELINE_NAME = "code_gen_baseline"
-
-# Five configured BBH task variants, each with a specification in
-# bbh_oracle.TASK_SPECS. Adding a variant requires a matching specification.
-# Report this subset as BBH-5; preserve individual task names in row categories.
-BBH_DISPLAY_NAME = "BBH-5"
-BBH_SUBSET_NOTE = (
-    "five configured task variants from BIG-Bench Hard; not the full suite"
-)
-
-BBH_TASKS = (
-    "date_understanding",
-    "boolean_expressions",
-    "tracking_shuffled_objects_three_objects",
-    "logical_deduction_five_objects",
-    "web_of_lies",
-)
-
-# Main experiment budgets. HumanEval+ includes every eligible function.
-MAIN_SIZES: Dict[str, Optional[int]] = {
-    "humaneval_plus": None,   # None = all eligible
-    "mbpp_plus": 200,
-    "gsm8k": 200,
-    "bbh": 200,
-}
-
-# Pilot budgets for plumbing checks.
-PILOT_SIZES: Dict[str, Optional[int]] = {
-    "humaneval_plus": 5,
-    "mbpp_plus": 5,
-    "gsm8k": 10,
-    "bbh": 10,               # up to two items per configured task
-}
-
-# ---------------------------------------------------------------------------
-# Item pools
-# ---------------------------------------------------------------------------
 
 @dataclass
 class PoolItem:
@@ -104,7 +47,7 @@ class PoolItem:
     item_id: str
     signature: str
     docstring: str
-    category: Optional[str] = None          # BBH task; None elsewhere
+    category: Optional[str] = None
     invocation_ids: List[str] = field(default_factory=list)
     payload: Any = None                     # loader-specific extra data
 
@@ -219,29 +162,10 @@ def _load_pool_with_revision(benchmark: str) -> tuple[List[PoolItem], Optional[s
         ]
         return pool, dataset_revision(dataset)
 
-    if benchmark == "bbh":
-        from datasets import load_dataset
-        pool: List[PoolItem] = []
-        revisions: Dict[str, Optional[str]] = {}
-        for task in BBH_TASKS:
-            dataset = load_dataset("lukaemon/bbh", task, split="test")
-            revisions[task] = dataset_revision(dataset)
-            for index, row in enumerate(dataset):
-                pool.append(PoolItem(
-                    item_id=f"{task}/{index}", signature="", docstring="",
-                    category=task, payload=row))
-        revision = (
-            json.dumps(revisions, sort_keys=True)
-            if any(value is not None for value in revisions.values()) else None
-        )
-        return pool, revision
-
     raise ValueError(f"unknown benchmark {benchmark!r}. Known: {ALL_BENCHMARKS}")
 
 
-# ---------------------------------------------------------------------------
 # Manifest
-# ---------------------------------------------------------------------------
 
 def resolve_generation_settings(
     generation: Any,
@@ -343,10 +267,11 @@ def build_manifest(
     benchmarks: Sequence[str] = ALL_BENCHMARKS,
     seed: int = DEFAULT_SEED,
     validation_mode: str = "strict",
-    include_baseline: bool = True,
     generation: Optional[Dict[str, Any]] = None,
     model_configs: Optional[Dict[str, Dict[str, Any]]] = None,
     attach_fingerprints: bool = True,
+    dataset_release: Optional[str] = None,
+    answer_format: str = LEGACY,
 ) -> Dict[str, Any]:
     """
     Perform every selection and return the manifest as a plain dict.
@@ -356,6 +281,7 @@ def build_manifest(
     Run-time verification compares that content; dataset metadata alone
     does not prove that the same observations are being evaluated.
     """
+    validate_answer_format(answer_format)
     generation_settings = resolve_generation_settings({} if generation is None else generation)
     configs = model_configs if model_configs is not None else {}
     if not isinstance(configs, dict):
@@ -381,42 +307,39 @@ def build_manifest(
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "seed": seed,
         "validation_mode": validation_mode,
+        "answer_format": answer_format,
         "models": list(models),
         "strategies": list(strategies),
-        "baseline": {
-            "name": BASELINE_NAME,
-            "benchmarks": sorted(BASELINE_BENCHMARKS & set(benchmarks)),
-        } if include_baseline else None,
         # Validated global settings; model entries override only fields they contain.
         "generation": generation_settings,
-        # Per-model provider/backend settings and generation overrides.
-        # Optional "reasoning" contains native backend overrides, shared by
-        # every strategy for that model. Omitted or {} sends no override.
-        # These are requested settings, not proof of the model's behavior.
+        # Per-model connection/generation settings. Native reasoning overrides
+        # apply to every strategy; omitted/{} sends none and proves no actual mode.
         "model_configs": frozen_configs,
         "benchmarks": {},
     }
 
+    prepared = None
+    if dataset_release is not None:
+        from prepared_data import load_release
+        prepared, reference = load_release(dataset_release)
+        manifest["data_policy"] = "reviewed_release_v1"
+        manifest["dataset_release"] = reference
+
     for bench in benchmarks:
-        pool, revision = _load_pool_with_revision(bench)
+        if prepared is None:
+            pool, revision = _load_pool_with_revision(bench)
+        else:
+            pool = _prepared_pool(prepared, bench)
+            revision = manifest["dataset_release"]["sha256"]
         by_id = {p.item_id: p for p in pool}
         if len(by_id) != len(pool):
             raise ValueError(f"{bench}: candidate pool contains duplicate item IDs")
         k = sizes.get(bench)
+        if prepared is not None and k is not None and k > len(pool):
+            raise ValueError(f"{bench}: requested {k} tasks, but only {len(pool)} are approved; finish review before sampling")
 
-        if bench == "bbh":
-            # Allocate the requested sample across the configured tasks.
-            strata = {t: [p.item_id for p in pool if p.category == t] for t in BBH_TASKS}
-            chosen = select_stratified(
-                strata, k if k is not None else len(pool), seed, salt=bench,
-            )
-            ids = [i for t in sorted(chosen) for i in chosen[t]]
-            stratum_counts = {t: len(v) for t, v in chosen.items()}
-        else:
-            all_ids = [p.item_id for p in pool]
-            ids = select_items(all_ids, k if k is not None else len(all_ids),
-                               seed, salt=bench)
-            stratum_counts = None
+        all_ids = [p.item_id for p in pool]
+        ids = select_items(all_ids, k if k is not None else len(all_ids), seed, salt=bench)
 
         entries = []
         for item_id in ids:
@@ -432,8 +355,7 @@ def build_manifest(
 
         manifest["benchmarks"][bench] = {
             "group": BENCHMARK_GROUP[bench],
-            "display_name": BBH_DISPLAY_NAME if bench == "bbh" else bench,
-            "subset_note": BBH_SUBSET_NOTE if bench == "bbh" else None,
+            "display_name": bench,
             "requested": k,
             "selected": len(entries),
             "pool_size": len(pool),
@@ -441,7 +363,6 @@ def build_manifest(
             "dataset_revision": revision,
             # Filled from resolved invocation sources during fingerprint attachment.
             "invocation_pool_policy": None,
-            "strata": stratum_counts,
             "items": entries,
         }
 
@@ -451,6 +372,16 @@ def build_manifest(
     return manifest
 
 
+def _prepared_pool(data, benchmark):
+    from prepared_data import approved_items
+    return [PoolItem(
+        item_id=item["item_id"], signature=item["signature"],
+        docstring=item["specification"],
+        invocation_ids=[value["invocation_id"] for value in item["observations"]],
+        payload=item,
+    ) for item in approved_items(data, benchmark)]
+
+
 def _attach_content_fingerprints(manifest: Dict[str, Any]) -> None:
     """Fingerprint every selected item using the runner's resolution adapters.
 
@@ -458,7 +389,7 @@ def _attach_content_fingerprints(manifest: Dict[str, Any]) -> None:
     manifest with incomplete content verification. Adapters reload sources;
     verification at run time checks whether that resolved content has changed.
     """
-    from adapters import get_adapter  # Deferred: adapters imports this module.
+    from adapters import get_adapter  # Loaded only when attaching fingerprints.
 
     for benchmark, entry in manifest["benchmarks"].items():
         selected_ids = [item["item_id"] for item in entry["items"]]
@@ -617,10 +548,11 @@ def check_compatible(manifest: Dict[str, Any]) -> None:
     """
     if not isinstance(manifest, dict):
         raise ValueError("manifest must be an object")
+    validate_answer_format(manifest.get("answer_format", LEGACY))
     mv = manifest.get("manifest_version")
     if type(mv) is not int or mv != MANIFEST_VERSION:
         raise ValueError(
-            f"manifest_version {mv} != {MANIFEST_VERSION} supported by this code. "
+            f"manifest_version {mv} is unsupported; expected {MANIFEST_VERSION}. "
             f"Rebuild the manifest, or check out the revision that wrote it."
         )
     sv = manifest.get("selection_algorithm_version")
@@ -630,16 +562,14 @@ def check_compatible(manifest: Dict[str, Any]) -> None:
             f"Selection or fingerprint rules differ, or the version is not an integer; "
             f"rebuild the manifest."
         )
-
-
-def manifest_items(manifest: Dict[str, Any], benchmark: str) -> List[Dict[str, Any]]:
-    entry = manifest["benchmarks"].get(benchmark)
-    if entry is None:
-        raise ValueError(
-            f"benchmark {benchmark!r} is not in this manifest "
-            f"(has: {sorted(manifest['benchmarks'])})"
-        )
-    return entry["items"]
+    policy = manifest.get("data_policy")
+    if policy not in (None, "reviewed_release_v1"):
+        raise ValueError(f"Unsupported experiment data_policy {policy!r}")
+    if policy == "reviewed_release_v1" or "dataset_release" in manifest:
+        if policy != "reviewed_release_v1":
+            raise ValueError("Prepared dataset reference requires reviewed_release_v1 policy")
+        from prepared_data import release_for_manifest
+        release_for_manifest(manifest)
 
 
 def check_pools(manifest: Dict[str, Any], benchmark: str) -> Optional[str]:
@@ -653,7 +583,12 @@ def check_pools(manifest: Dict[str, Any], benchmark: str) -> Optional[str]:
     recorded = entry.get("pool_fingerprint") if entry else None
     if not recorded:
         return None
-    current = _fingerprint(sorted(p.item_id for p in load_pool(benchmark)))
+    if manifest.get("data_policy") == "reviewed_release_v1":
+        from prepared_data import release_for_manifest
+        pool = _prepared_pool(release_for_manifest(manifest), benchmark)
+    else:
+        pool = load_pool(benchmark)
+    current = _fingerprint(sorted(p.item_id for p in pool))
     if current != recorded:
         return (f"{benchmark}: pool fingerprint changed "
                 f"({recorded} -> {current}); item IDs may no longer refer to "

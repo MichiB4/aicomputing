@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
-"""
-Build an experiment manifest: the frozen list of items every cell evaluates.
+"""Freeze reviewed three-benchmark selections and model settings.
 
-Selection happens once, here, and is written to disk. Runs read the recorded
-item and invocation IDs rather than sampling again. Each cell resolves those
-IDs through the benchmark adapters and verifies the selected content before
-model execution, unless the explicit debug drift override is used. Results
-join on benchmark_item_id; this does not guarantee identical model outputs.
-
-Two configurations ship:
-
-    --preset pilot   small smoke configuration (pilot-v3). Verifies plumbing.
-    --preset main    the configured primary-experiment sample sizes.
-
-Examples
---------
-    python scripts/make_manifest.py --preset pilot
-    python scripts/make_manifest.py --preset main --models a b c d
-    python scripts/make_manifest.py --preset main --seed 42 --out manifests/main.json
-
-Matching seeds, ID pools, invocation ordering and selection rules reproduce
-the selection. A rebuilt manifest can still differ, including its timestamp.
-Dataset metadata describes available source information; it is not proof of
-identical resolved content. ID-pool checks detect changes to the ID collection;
-selected-content verification detects missing fingerprints, incomplete item
-coverage and changes to recorded specifications, inputs or expected outputs.
-Default construction fails if selected content cannot be fully fingerprinted.
+For the audited Luna workflow use python -m evaluation.prepare. This CLI also
+supports manifests for future local models through explicit model configuration.
 """
 
 from __future__ import annotations
@@ -34,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -51,34 +29,25 @@ if __name__ == "__main__":
 from experiment import (  # noqa: E402
     ALL_BENCHMARKS,
     DEFAULT_SEED,
-    MAIN_SIZES,
-    PILOT_SIZES,
     build_manifest,
     save_manifest,
     resolve_model_connection,
     resolve_reasoning_settings,
     resolve_generation_settings,
 )
-from aicomputing.strategies import list_arms  # noqa: E402
+from aicomputing.answer_protocol import ANSWER_FORMATS, FRAMED_V1, FRAMED_TEXT_V1  # noqa: E402
+from aicomputing.prompting import FRAMED_PROMPT_REVISION  # noqa: E402
 
-PRESETS = {
-    "pilot": {
-        "experiment_id": "pilot-v3",
-        "sizes": PILOT_SIZES,
-        "default_out": "manifests/pilot-v3.json",
-    },
-    "main": {
-        "experiment_id": "main-v2",
-        "sizes": MAIN_SIZES,
-        "default_out": "manifests/main-v2.json",
-    },
-}
+DEFAULT_SIZES = {"humaneval_plus": 100, "mbpp_plus": 100, "gsm8k": 100}
+DEFAULT_STRATEGIES = ["direct", "cot", "pseudocode", "contract"]
+
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build an experiment manifest")
-    ap.add_argument("--preset", choices=sorted(PRESETS), default="pilot")
-    ap.add_argument("--out", default=None, help="Output path (default: per preset)")
+    ap.add_argument("--experiment-id", required=True)
+    ap.add_argument("--dataset-release", required=True, help="Approved local data release; no network lookup.")
+    ap.add_argument("--out", default=None, help="Output path; defaults to manifests/<experiment-id>.json")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
     ap.add_argument("--model-configs", default=None, metavar="JSON",
                     help="Path to JSON model entries with provider or backend, "
@@ -91,16 +60,22 @@ def main() -> int:
                          "no availability check is made here, because provider "
                          "catalogs drift and an unverified assumption baked "
                          "into a manifest is worse than none.")
-    ap.add_argument("--benchmarks", nargs="+", default=list(ALL_BENCHMARKS),
+    ap.add_argument("--benchmarks", nargs="+", default=None,
                     choices=list(ALL_BENCHMARKS))
-    ap.add_argument("--strategies", nargs="+", default=list_arms(),
-                    help=f"Default: the evaluation arms ({', '.join(list_arms())})")
+    ap.add_argument("--strategies", nargs="+", default=None,
+                    help="Default: direct, cot, pseudocode, contract")
     ap.add_argument("--validation-mode", choices=("strict", "warn"), default="strict")
-    ap.add_argument("--no-baseline", action="store_true",
-                    help="Omit the code-generation baseline from the manifest")
+    ap.add_argument("--answer-format", choices=ANSWER_FORMATS, default=None,
+                    help="Response protocol; defaults to framed_text_v1")
     args = ap.parse_args()
+    if not args.experiment_id.strip() or Path(args.experiment_id).name != args.experiment_id:
+        ap.error("experiment-id must be a nonempty filename component")
+    args.benchmarks = args.benchmarks or list(DEFAULT_SIZES)
+    args.strategies = args.strategies or list(DEFAULT_STRATEGIES)
+    if args.validation_mode != "strict":
+        ap.error("Reviewed evaluations require strict validation")
 
-    # --- resolve the frozen model configuration, if any --------------------
+    # resolve the frozen model configuration, if any
     model_configs = {}
     if args.model_configs:
         with open(args.model_configs, encoding="utf-8") as fh:
@@ -120,21 +95,24 @@ def main() -> int:
                      "supply one or the other")
         args.models = sorted(model_configs)
 
-    preset = PRESETS[args.preset]
-    out = args.out or os.path.join(_ROOT, preset["default_out"])
+    out = args.out or os.path.join(_ROOT, "manifests", args.experiment_id + ".json")
 
-    print(f"Building '{preset['experiment_id']}' manifest (seed={args.seed}) ...")
+    print(f"Building '{args.experiment_id}' manifest (seed={args.seed}) ...")
     manifest = build_manifest(
-        experiment_id=preset["experiment_id"],
+        experiment_id=args.experiment_id,
         models=args.models,
         strategies=args.strategies,
-        sizes=preset["sizes"],
+        sizes=DEFAULT_SIZES,
         benchmarks=args.benchmarks,
         seed=args.seed,
         validation_mode=args.validation_mode,
-        include_baseline=not args.no_baseline,
         model_configs=model_configs,
+        dataset_release=args.dataset_release,
+        generation={"max_retries": 0},
+        answer_format=args.answer_format or FRAMED_TEXT_V1,
     )
+    if manifest["answer_format"] in (FRAMED_V1, FRAMED_TEXT_V1):
+        manifest["prompt_revision"] = FRAMED_PROMPT_REVISION
     save_manifest(manifest, out)
 
     print(f"\n{'benchmark':16}{'group':16}{'selected':>10}{'pool':>8}")
@@ -150,9 +128,7 @@ def main() -> int:
     print(f"{'TOTAL':16}{'':16}{total:>10}")
 
     strategies = manifest["strategies"]
-    baseline = manifest.get("baseline")
     print(f"\nstrategies : {', '.join(strategies)}")
-    print(f"baseline   : {baseline['name'] + ' on ' + ', '.join(baseline['benchmarks']) if baseline else 'none'}")
     print(f"validation : {manifest['validation_mode']}")
     if manifest["model_configs"]:
         print("models     : FROZEN")
@@ -164,7 +140,6 @@ def main() -> int:
               "a selection template, not a run manifest. Rebuild with "
               "--model-configs before a reported run.")
     print(f"cells      : {len(strategies)} strategies x {len(manifest['benchmarks'])} benchmarks"
-          + (f" + baseline x {len(baseline['benchmarks'])}" if baseline else "")
           + (f", x {len(manifest['models'])} models" if manifest["models"] else ""))
     print(f"\nwrote {out}")
     return 0

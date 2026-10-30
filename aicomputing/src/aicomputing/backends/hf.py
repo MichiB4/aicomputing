@@ -1,18 +1,11 @@
-"""
-HuggingFace Transformers backend for AI Computing.
+"""Local Transformers inference for one configured model; stop sequences are unsupported.
 
-Loads a model locally via the transformers library. An optional
-backend-level enable_thinking setting is passed to the chat template.
-Support depends on the actual template; the recorded setting is not
-proof of the model's reasoning mode. Each instance uses its configured
-model. Nonempty stop sequences are not supported.
+enable_thinking is passed to the chat template; support depends on that template.
+Recorded settings do not establish the model's reasoning mode.
 
-None permits generation until EOS or the remaining declared model context.
-An explicit positive allowance is required when context capacity is unknown.
-
-Recognized leading <think> blocks are removed from decoded output. A
-rendered template ending in <think> supplies the opener for cleanup.
-The decoded completion is retained in raw metadata.
+None permits generation until EOS or the remaining model context. Unknown
+context capacity requires an explicit token allowance. Leading <think> blocks
+are stripped, including openers supplied by the template; raw output is retained.
 
 Install: pip install aicomputing[hf]
 """
@@ -28,15 +21,11 @@ from .base import Backend, GenerateResponse, ReasoningCapabilities
 
 
 def _declared_context_length(model: Any, tokenizer: Any) -> Optional[int]:
-    """Find the authoritative finite model context, ignoring output defaults.
+    """Find finite context capacity, ignoring output defaults and sentinels >=1e20.
 
-    Transformers uses values around 1e30 when tokenizer capacity is unknown.
-    Its own LARGE_INTEGER threshold is 1e20; those sentinels are not usable
-    context windows. Prefer a text-specific configuration, then the model's
-    configuration. Within either, prefer max_position_embeddings, followed
-    by the listed legacy aliases. A tokenizer limit is only a fallback: stale
-    tokenizer or legacy values must not clip a canonical model declaration.
-    Sliding windows and RoPE factors are not total context lengths.
+    Prefer text configuration, then model configuration, then tokenizer fallback.
+    Within configurations, prefer max_position_embeddings over legacy aliases.
+    Sliding windows and RoPE factors do not define total capacity.
     """
     config = getattr(model, "config", None)
     configurations = (getattr(config, "text_config", None), config)
@@ -74,6 +63,16 @@ class HFBackend(Backend):
         self._device = device
         self._model = None
         self._tokenizer = None
+
+    def close(self) -> None:
+        """Drop loaded model/tokenizer references; later generation reloads.
+
+        This does not import inference dependencies or clear process-wide
+        GPU allocator caches. Do not close during generation.
+        """
+        self._model = None
+        self._tokenizer = None
+        self._device = self._configured_device
 
     reasoning_parameter = "enable_thinking"
     _reasoning_value_types = (bool,)
@@ -182,8 +181,7 @@ class HFBackend(Backend):
         context_length = _declared_context_length(self._model, self._tokenizer)
         effective_max_new_tokens = max_new_tokens
         if effective_max_new_tokens is None:
-            # Omitting this option can restore Transformers' 20-token default.
-            # Use the model's remaining context rather than an arbitrary cap.
+            # Avoid Transformers' finite default by using the remaining context.
             if context_length is None:
                 raise ValueError(
                     "HFBackend cannot infer a finite model context length; "
@@ -224,8 +222,7 @@ class HFBackend(Backend):
             raw_text = "<think>" + raw_text
         raw_text = strip_thinking(raw_text)
 
-        # Infer local termination from the output length and final EOS token.
-        # Strategies use "length" to retry with a larger token budget.
+        # Reaching the allowance without EOS signals truncation.
         n_new = len(new_tokens)
         ended_with_eos = (
             n_new > 0

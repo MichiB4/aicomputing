@@ -11,7 +11,6 @@ license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
   "ollama>=0.4.0",
-  "pydantic>=2.7",
 ]
 keywords = ["LLM", "runtime", "predictive execution", "ai computing", "oracle"]
 classifiers = [
@@ -22,17 +21,9 @@ classifiers = [
 [project.optional-dependencies]
 hf = ["transformers>=4.43,<5", "accelerate>=0.33.0", "sentencepiece>=0.1.99", "torch>=2.3"]
 openai = ["openai>=1.30"]
-# evalplus supplies the HumanEval+ base/plus labelling and the MBPP+ inputs
-# the ground-truth builder consumes. Without it the adapters degrade to
-# pool="unknown" and MBPP+ plus invocations cannot be constructed, so it
-# belongs in the benchmark extra rather than being discovered at runtime.
-benchmarks = ["human-eval", "evalplus>=0.3", "datasets>=2.0", "tqdm",
-              "truststore>=0.8", "openpyxl>=3.1"]
-dev = ["pytest>=8", "pytest-cov"]
-# Core plus dev dependencies support collection of the current test suite.
-# The test extra also includes benchmark-related dependencies.
-test = ["pytest>=8", "pytest-cov", "evalplus>=0.3", "datasets>=2.0",
-        "human-eval", "tqdm", "truststore>=0.8"]
+# EvalPlus supplies base-input metadata for raw HumanEval+ preparation.
+benchmarks = ["evalplus>=0.3", "datasets>=2.0", "tqdm",
+              "truststore>=0.8", "packaging>=23"]
 
 [project.scripts]
 aicomp = "aicomputing.cli:main"

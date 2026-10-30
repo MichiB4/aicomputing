@@ -1,84 +1,21 @@
-"""
-EvalPlus (HumanEval+ / MBPP+) adapters for spec-only execution.
+"""Load HumanEval+/MBPP+ specifications and invocations without running solutions.
 
-These two benchmarks are the CORE specification-execution benchmarks. Both are
-reduced here to the same shape the virtual runtime consumes:
+The manifest selects one seeded invocation per function. HumanEval targets come
+from aligned literal inputs/results lists; nonliteral targets are ineligible.
+Base/plus labels use content matching because dataset/package ordering differs.
 
-    signature + docstring  (the specification)
-    inputs                 (one concrete invocation)
-    expected               (ground truth for that invocation)
+MBPP prefers published literal input/output lists. Public base asserts cover
+sources without precomputed output lists.
 
-One invocation per function
----------------------------
-The primary experiment evaluates each function once. EvalPlus ships ~1000
-inputs per HumanEval task, and evaluating all of them would make the "sample
-size" an artefact of test-suite depth rather than of benchmark coverage: a
-single function with 1100 stress inputs would outweigh a hundred others. It
-would also break the paired analysis, whose unit is the function.
-
-Which invocation is chosen matters. EvalPlus orders each suite with the
-original hand-written cases first and the generated stress cases after, so
-taking index 0 would systematically select the easiest input for every
-function. selection.derive_index() gives each function an independent seeded
-draw across its whole suite instead.
-
-Where ground truth comes from
------------------------------
-No reference implementation is ever executed here.
-
-  HumanEval+  the compiled `test` script assigns two literal lists inside
-              check(): `inputs` and `results`, aligned pairwise. Both are read
-              with ast.literal_eval. 158 of 164 tasks expose them this way;
-              the other six build `results` from an expression and are
-              reported as ineligible rather than silently dropped.
-
-  MBPP+       a frozen ground-truth cache can supply base and plus invocations
-              with expected values computed offline. Loading it does not
-              execute the reference implementation. Otherwise, `test_list`
-              supplies canonical positional
-              `assert f(<literals>) == <literal>` cases; wrapped and
-              keyword-bearing calls are skipped.
-
-Invocation pool policy
-----------------------
-  HumanEval+  base + plus. The HF `inputs` list IS the expanded EvalPlus
-              suite (HumanEval/0: 1006 = 7 base + 999 plus) and every entry
-              has a precomputed expected value in the aligned `results` list.
-              Verified pool: 1,492 base + 120,986 plus across 158 tasks.
-              Each invocation is labelled base/plus BY CONTENT, because the
-              HF build and the evalplus package release are different
-              revisions -- positional labelling matched on only 65 of 158
-              tasks, whereas content matching classified 100% with 0
-              unlabelled.
-
-  MBPP+       frozen invocations for cached items; available records can come
-              from the base and plus pools. Items without cached ground truth
-              use base-only cases parsed from `test_list`.
-              `scripts/build_mbpp_ground_truth.py` executes canonical solutions
-              offline to build that cache, separately from loading specifications.
-              Each selected invocation records its actual `pool` label, and
-              `invocation_pool_policy` summarizes those labels in the manifest.
-
-
-What the model is shown
------------------------
-Only signature + docstring + the selected input. In particular:
-
-  * the reference solution (`canonical_solution` / `code`) is used solely to
-    recover MBPP's function SIGNATURE, which MBPP's natural-language prompt
-    does not contain. The body is never shown to the model.
-  * `>>>` doctest examples are stripped from HumanEval docstrings by default.
-    They are part of the public specification rather than hidden tests, but
-    they are worked input/output pairs, and leaving them in would make every
-    arm partially few-shot on exactly the quantity being measured. Controlled
-    by keep_doctests= so the decision is explicit and reversible.
-"""
+Models receive only signature, docstring, and selected inputs. Reference code
+supplies MBPP signatures only. HumanEval doctests are stripped unless requested;
+the reviewed-release workflow defines its own public-example policy.
+HumanEval/38 adds an AST-verified public-helper description, never executable
+helper code. Explicit specification exclusions record their reasons below."""
 
 from __future__ import annotations
 
 import ast
-import json
-import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -86,10 +23,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from aicomputing.types import parse_signature
 
-# HuggingFace dataset IDs. Pinned here rather than inline so a provider change
-# is a one-line edit; both are public and require no token.
+# Public HuggingFace dataset IDs.
 HUMANEVALPLUS_DATASET = "evalplus/humanevalplus"
 MBPPPLUS_DATASET = "evalplus/mbppplus"
+
+_MBPP_SPECIFICATION_EXCLUSIONS = {
+    "Mbpp/419": (
+        "specification asks to print a value, but the frozen reference grades "
+        "a returned number; print-versus-return behavior is inconsistent"
+    ),
+}
 
 
 @dataclass
@@ -98,7 +41,7 @@ class Invocation:
     invocation_id: str          # stable within the item, e.g. "in:37"
     inputs: Dict[str, Any]      # keyword form, as the runtime expects
     expected: Any
-    input_line: str             # human-readable rendering, for the CSV
+    input_line: str             # Human-readable call.
     pool: str = "unknown"       # "base" | "plus" | "unknown"
 
 
@@ -117,18 +60,12 @@ class SpecItem:
         return self.ineligible_reason is None and bool(self.invocations)
 
 
-# ---------------------------------------------------------------------------
 # Shared helpers
-# ---------------------------------------------------------------------------
 
 def _param_names(signature: str) -> List[str]:
-    """
-    Parameter names from a signature string, annotations and defaults removed.
+    """Extract parameter names with AST parsing so generic-annotation commas are safe.
 
-    Parsed with ast rather than split(",") because annotations legitimately
-    contain commas — `Dict[str, int]` would otherwise be read as two
-    parameters and every input dict would be built with the wrong keys.
-    """
+    Malformed headers fall back to bare-name parsing."""
     try:
         tree = ast.parse(f"def {signature.rstrip(':')}: pass")
     except SyntaxError:
@@ -157,33 +94,99 @@ def _render_call(entry_point: str, values: Sequence[Any]) -> str:
     return f"{entry_point}({', '.join(repr(v) for v in values)})"
 
 
-# ---------------------------------------------------------------------------
 # HumanEval+
-# ---------------------------------------------------------------------------
 
-def _humaneval_signature(prompt: str) -> str:
-    """Last `def` line in the prompt, without the trailing colon."""
-    sig = None
-    for line in prompt.splitlines():
-        s = line.strip()
-        if s.startswith("def ") and s.endswith(":"):
-            sig = s[len("def "):-1]
-    if sig is None:
-        raise ValueError("no function definition found in prompt")
-    return sig
+def _humaneval_target(prompt: str, entry_point: Optional[str] = None) -> Tuple[ast.Module, ast.FunctionDef]:
+    """Locate one declared top-level function without evaluating its module."""
+    module = ast.parse(prompt)
+    functions = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    targets = [node for node in functions if node.name == entry_point] if entry_point is not None else functions
+    if len(targets) != 1:
+        raise ValueError("HumanEval requires one unambiguous declared entry point")
+    if isinstance(targets[0], ast.AsyncFunctionDef):
+        raise ValueError("asynchronous HumanEval entry points are unsupported")
+    return module, targets[0]
 
 
-def _humaneval_docstring(prompt: str, *, keep_doctests: bool) -> str:
-    """
-    The task description from a HumanEval prompt.
+def _humaneval_signature(prompt: str, entry_point: Optional[str] = None) -> str:
+    """Extract the declared target's interface; preserve simple source headers."""
+    _, target = _humaneval_target(prompt, entry_point)
+    line = prompt.splitlines()[target.lineno - 1].strip()
+    if line.startswith("def ") and line.endswith(":"):
+        return line[len("def "):-1]
+    signature = f"{target.name}({ast.unparse(target.args)})"
+    if target.returns is not None:
+        signature += f" -> {ast.unparse(target.returns)}"
+    return signature
 
-    The prompt is a module: imports, the def line, then a docstring. Only the
-    docstring is the specification; everything else is scaffolding the model
-    does not need. `>>>` blocks are dropped unless keep_doctests is set (see
-    the module docstring for why).
-    """
-    m = re.search(r'("""|\'\'\')(.*?)\1', prompt, re.S)
-    body = m.group(2) if m else prompt
+
+_HUMANEVAL_SPECIFICATION_EXCLUSIONS = {
+    "HumanEval/32": (
+        "specification permits multiple valid roots; comparison with one frozen "
+        "reference value cannot grade specification-to-output prediction"
+    ),
+    "HumanEval/50": (
+        "insufficient standalone decoding specification; generated inputs can "
+        "fall outside the public encoder's lowercase output domain"
+    ),
+}
+
+# Reviewed public helper, never executed or sent to the model. Parse both the
+# actual and reviewed helper on the same interpreter: AST formatting varies
+# across supported Python versions. Changes require specification review.
+_CYCLIC_PUBLIC_HELPER_SOURCE = '''
+def encode_cyclic(s: str):
+    """returns encoded string by cycling groups of three characters."""
+    groups = [s[(3 * i):min((3 * i + 3), len(s))] for i in range((len(s) + 2) // 3)]
+    groups = [(group[1:] + group[0]) if len(group) == 3 else group for group in groups]
+    return "".join(groups)
+'''
+_CYCLIC_PUBLIC_HELPER_SPEC = (
+    "Public helper specification (from the task prompt):\n"
+    "encode_cyclic partitions the input string from left to right into "
+    "consecutive groups of three Python characters. In each full "
+    "three-character group it moves the first character to the end. "
+    "A final group of one or two characters is unchanged. The groups are "
+    "joined without separators. Decoding reverses this transformation: "
+    "move the last character of each full three-character group to its "
+    "front, leaving a final shorter group unchanged."
+)
+
+
+def _humaneval_cyclic_helper_spec(module: ast.Module) -> str:
+    helpers = [node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and node.name == "encode_cyclic"]
+    if len(helpers) != 1 or isinstance(helpers[0], ast.AsyncFunctionDef):
+        raise ValueError("decode_cyclic requires its unambiguous public encoder specification")
+    def structure(helper):
+        docstring = ast.get_docstring(helper)
+        return {
+            "name": helper.name,
+            "arguments": ast.dump(helper.args, include_attributes=False),
+            "docstring": docstring,
+            "body": [ast.dump(node, include_attributes=False)
+                     for node in (helper.body[1:] if docstring is not None else helper.body)],
+            "returns": ast.dump(helper.returns, include_attributes=False) if helper.returns else None,
+            "decorators": [ast.dump(node, include_attributes=False) for node in helper.decorator_list],
+            "type_parameters": [ast.dump(node, include_attributes=False) for node in getattr(helper, "type_params", [])],
+        }
+
+    reviewed = ast.parse(_CYCLIC_PUBLIC_HELPER_SOURCE).body[0]
+    if structure(helpers[0]) != structure(reviewed):
+        raise ValueError("decode_cyclic public helper changed; its declarative specification requires review")
+    return _CYCLIC_PUBLIC_HELPER_SPEC
+
+
+def _humaneval_docstring(prompt: str, *, keep_doctests: bool,
+                        entry_point: Optional[str] = None) -> str:
+    """Extract the declared entry point's description, optionally retaining examples.
+
+    Ignore module/helper docstrings. decode_cyclic adds reviewed public-helper
+    context; implementation code is neither executed nor included."""
+    module, target = _humaneval_target(prompt, entry_point)
+    body = ast.get_docstring(target, clean=False)
+    if body is None or not body.strip():
+        raise ValueError("HumanEval entry point has no nonempty specification docstring")
     lines = []
     for line in body.splitlines():
         if not keep_doctests and line.strip().startswith(">>>"):
@@ -192,16 +195,16 @@ def _humaneval_docstring(prompt: str, *, keep_doctests: bool) -> str:
     text = "\n".join(lines)
     # Collapse the indentation the prompt carries and tidy blank edges.
     text = "\n".join(l.strip() for l in text.splitlines())
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    description = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not description:
+        raise ValueError("HumanEval entry point has no standalone description before its examples")
+    if target.name == "decode_cyclic":
+        description += "\n\n" + _humaneval_cyclic_helper_spec(module)
+    return description
 
 
 def _humaneval_pairs(test_src: str) -> Tuple[List[Any], List[Any]]:
-    """
-    The `inputs` and `results` literal lists from an EvalPlus test script.
-
-    Raises ValueError when either is absent or non-literal, which is how the
-    six known ineligible tasks are detected.
-    """
+    """Read aligned literal inputs/results lists; reject missing or nonliteral targets."""
     tree = ast.parse(test_src)
     found: Dict[str, Any] = {}
     for node in ast.walk(tree):
@@ -224,22 +227,9 @@ def _humaneval_pairs(test_src: str) -> Tuple[List[Any], List[Any]]:
 
 
 def _humaneval_base_keys() -> Optional[Dict[str, set]]:
-    """
-    Per-task set of BASE inputs, used to label the HF pool base vs plus.
+    """Match base inputs by content; dataset/package ordering may differ.
 
-    The HuggingFace `evalplus/humanevalplus` build ships one flat `inputs`
-    list with no base/plus marking, so the split has to come from the evalplus
-    package, which exposes `base_input` and `plus_input` separately.
-
-    Labelling is by CONTENT, not by index. Positional labelling was tried and
-    is wrong: only 65 of 158 tasks have the HF list equal to
-    base_input + plus_input in order, because the HF build and the package
-    release are different revisions. Content matching classified 100% of the
-    122,478-input pool when this was verified, with 0 unlabelled.
-
-    Returns None when the package is unavailable; callers then record the pool
-    as "unknown" rather than guessing.
-    """
+    Return None when metadata is unavailable so callers record unknown pool labels."""
     try:
         from evalplus.data import get_human_eval_plus
     except Exception:
@@ -261,15 +251,7 @@ def _humaneval_base_keys() -> Optional[Dict[str, set]]:
 
 
 def load_humanevalplus(*, keep_doctests: bool = False) -> List[SpecItem]:
-    """
-    Load HumanEval+ as SpecItems. Ineligible tasks are returned, flagged.
-
-    The selectable invocation pool is base + plus: the HF `inputs` list is the
-    full EvalPlus-expanded suite (1006 for HumanEval/0 = 7 base + 999 plus),
-    and each entry is labelled by content so the chosen invocation's origin is
-    recorded. Ground truth comes from the aligned `results` list, so no
-    reference implementation is executed.
-    """
+    """Load base/plus invocations and literal targets, retaining flagged ineligible tasks."""
     from datasets import load_dataset
 
     base_keys = _humaneval_base_keys()
@@ -277,14 +259,19 @@ def load_humanevalplus(*, keep_doctests: bool = False) -> List[SpecItem]:
     for row in load_dataset(HUMANEVALPLUS_DATASET, split="test"):
         task_id = row["task_id"]
         try:
-            signature = _humaneval_signature(row["prompt"])
+            signature = _humaneval_signature(row["prompt"], row["entry_point"])
             # Reject unusable signatures before they enter the selection pool.
             parse_signature(signature)
-        except ValueError as exc:
+            docstring = _humaneval_docstring(row["prompt"], keep_doctests=keep_doctests,
+                                             entry_point=row["entry_point"])
+        except (ValueError, SyntaxError) as exc:
             items.append(SpecItem(task_id, "", "", row["entry_point"],
                                   ineligible_reason=str(exc)))
             continue
-        docstring = _humaneval_docstring(row["prompt"], keep_doctests=keep_doctests)
+        if task_id in _HUMANEVAL_SPECIFICATION_EXCLUSIONS:
+            items.append(SpecItem(task_id, signature, docstring, row["entry_point"],
+                                  ineligible_reason=_HUMANEVAL_SPECIFICATION_EXCLUSIONS[task_id]))
+            continue
         names = _param_names(signature)
         try:
             raw_inputs, raw_results = _humaneval_pairs(row["test"])
@@ -313,21 +300,11 @@ def load_humanevalplus(*, keep_doctests: bool = False) -> List[SpecItem]:
     return items
 
 
-# ---------------------------------------------------------------------------
 # MBPP+
-# ---------------------------------------------------------------------------
 
 def _mbpp_signature(code: str, entry_point: Optional[str] = None) -> Tuple[str, str]:
-    """
-    Signature and function name from MBPP's reference solution.
-
-    Only the `def` line is read. MBPP's prompt is one English sentence with no
-    interface, so the signature has to come from somewhere; the body is never
-    used and never shown to the model.
-    """
-    # MBPP reference solutions contain regex literals written as plain strings
-    # ("\w+"), so parsing them raises SyntaxWarning on 3.12+. The warning is
-    # about the dataset's code, not ours, and there is nothing to fix in it.
+    """Extract MBPP's function name and signature; never expose its implementation."""
+    # Dataset regex strings can trigger escape warnings on Python 3.12+.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
         tree = ast.parse(code)
@@ -377,61 +354,14 @@ def _mbpp_invocations(test_list: Sequence[str], entry_point: str,
     return out
 
 
-MBPP_GROUND_TRUTH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "data", "mbpp_plus_ground_truth.json")
+def load_mbppplus() -> List[SpecItem]:
+    """Prefer published targets; missing lists may use public base asserts.
 
-
-def load_mbpp_ground_truth(path: str = MBPP_GROUND_TRUTH) -> Optional[Dict[str, Any]]:
-    """
-    Load the frozen MBPP+ expected-output cache, if it has been built.
-
-    Built offline by scripts/build_mbpp_ground_truth.py, which executes the
-    official canonical solutions ONCE to compute expected outputs and freezes
-    them. The artifact contains only item IDs, inputs, expected values and
-    provenance -- never the implementation -- so nothing downstream can expose
-    a reference solution even by accident.
-
-    Decode typed inputs and expected values. Legacy or unknown cache formats
-    must be rebuilt; their original value types cannot be inferred safely.
-    Returns None when the cache is absent, in which case MBPP+ falls back to
-    base-only invocations from `test_list`.
-    """
-    if not os.path.exists(path):
-        return None
-    from mbpp_ground_truth import (
-        GROUND_TRUTH_VERSION, VALUE_ENCODING, decode_value,
-    )
-
-    with open(path, encoding="utf-8") as fh:
-        cache = json.load(fh)
-    if (type(cache) is not dict
-            or type(cache.get("ground_truth_version")) is not int
-            or cache["ground_truth_version"] != GROUND_TRUTH_VERSION
-            or cache.get("value_encoding") != VALUE_ENCODING):
-        raise ValueError(
-            "Unsupported MBPP ground-truth cache; rebuild it with "
-            "scripts/build_mbpp_ground_truth.py"
-        )
-    for task in cache["tasks"].values():
-        for inv in task["invocations"]:
-            inv["inputs"] = decode_value(inv["inputs"])
-            inv["expected"] = decode_value(inv["expected"])
-    return cache
-
-
-def load_mbppplus(*, ground_truth_path: str = MBPP_GROUND_TRUTH) -> List[SpecItem]:
-    """
-    Load MBPP+ as SpecItems. Ineligible items are returned, flagged.
-
-    Cached items use their frozen invocation records. Other items fall back
-    to base-only cases from `test_list`. Each invocation's `pool` label records
-    the actual source used.
+    Malformed published lists fail closed. Reference implementations never run.
     """
     from datasets import load_dataset
+    from mbpp_published import extract_pairs, NoPublishedTargets, base_input_keys, pool_for
 
-    cache = load_mbpp_ground_truth(ground_truth_path)
-    cached_tasks = (cache or {}).get("tasks", {})
     items: List[SpecItem] = []
     for row in load_dataset(MBPPPLUS_DATASET, split="test"):
         item_id = f"Mbpp/{row['task_id']}"
@@ -441,23 +371,33 @@ def load_mbppplus(*, ground_truth_path: str = MBPP_GROUND_TRUTH) -> List[SpecIte
             items.append(SpecItem(item_id, "", row["prompt"], "",
                                   ineligible_reason=f"unparseable reference: {exc}"))
             continue
+        if item_id in _MBPP_SPECIFICATION_EXCLUSIONS:
+            items.append(SpecItem(item_id, signature, (row["prompt"] or "").strip(), entry_point,
+                                  ineligible_reason=_MBPP_SPECIFICATION_EXCLUSIONS[item_id]))
+            continue
         names = _param_names(signature)
-        frozen = cached_tasks.get(item_id)
-        if frozen:
-            # base + plus, from the frozen cache.
-            invocations = [
-                Invocation(
-                    invocation_id=f"gt:{inv['index']}",
-                    inputs=_to_kwargs(inv["inputs"], names),
-                    expected=inv["expected"],
-                    input_line=_render_call(entry_point, inv["inputs"]),
-                    pool=inv["pool"],
-                )
-                for inv in frozen["invocations"]
-            ]
+        try:
+            if not row.get("test"):
+                raise NoPublishedTargets("source has no test program")
+            published = extract_pairs(row["test"], entry_point, len(names))
+        except NoPublishedTargets:
+            pass
+        except (ValueError, SyntaxError) as exc:
+            items.append(SpecItem(item_id, signature, (row["prompt"] or "").strip(), entry_point,
+                                  ineligible_reason=f"unusable published ground truth: {exc}"))
+            continue
         else:
-            # base only, parsed from the published asserts.
-            invocations = _mbpp_invocations(row["test_list"] or [], entry_point, names)
+            base_keys = base_input_keys(row.get("test_list") or [], entry_point)
+            invocations = [Invocation(
+                invocation_id=f"published:{index}", inputs=_to_kwargs(values, names),
+                expected=target, input_line=_render_call(entry_point, values),
+                pool=pool_for(values, base_keys),
+            ) for index, values, target in published.pairs]
+            reason = None if invocations else "no supported published input/output literals"
+            items.append(SpecItem(item_id, signature, (row["prompt"] or "").strip(),
+                                  entry_point, invocations, ineligible_reason=reason))
+            continue
+        invocations = _mbpp_invocations(row["test_list"] or [], entry_point, names)
         reason = None if invocations else "no canonical `assert f(...) == literal` test"
         items.append(SpecItem(item_id, signature, (row["prompt"] or "").strip(),
                               entry_point, invocations, ineligible_reason=reason))

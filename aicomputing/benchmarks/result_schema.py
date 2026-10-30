@@ -1,24 +1,12 @@
-"""
-Canonical per-invocation CSV schema for the manifest-driven benchmark runner.
+"""Canonical rows for manifest-driven evaluations.
 
-RESULT_COLUMNS defines output column order. The legacy oracle scripts retain
-their separate CSV formats.
+Graders supply correctness. Structural checks do not establish semantics, and
+explicit failures take precedence over answer comparisons.
+Unavailable token usage remains unknown.
 
-Rows record run and task identity, specifications and inputs, expected and
-predicted values, validation and failure diagnostics, contract revisions,
-reported usage, and generation settings.
-
-Correctness is supplied by the benchmark grader. Structural validation does
-not establish semantic correctness. Failure classification preserves explicit
-execution failures before considering whether an answer matches ground truth.
-
-Token and model-call fields reflect accounting recorded in ExecuteResult.
-Unavailable usage remains unknown; failed calls may have incomplete accounting.
-
-manifest_version records the manifest format version, not a unique experiment
-or item selection. Paired analysis also requires matching task invocations,
-data, inputs, and the relevant experiment settings.
-"""
+Frozen manifests retain invocation/provenance details. Paired analysis requires
+matching inputs and settings. retries combines validation and audited timeouts;
+token-budget retry detail is omitted. Historical files keep their original schema."""
 
 from __future__ import annotations
 
@@ -32,64 +20,49 @@ from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 from aicomputing.request import ExecuteResult, FailureType
+from aicomputing.answer_protocol import FRAMED_TEXT_V1
+from aicomputing.parsing import ParseOutcome
+from aicomputing.types import parse_signature
+from aicomputing.validation import validate_output
 
 # Canonical column order for newly written CSV files.
 # Consumers should address columns by name; older files may use an earlier schema.
 RESULT_COLUMNS: List[str] = [
-    # --- identity: what was run -------------------------------------------
     "run_id",
-    "timestamp",
     "model",
     "strategy",
-    "is_baseline",
-    # --- identity: what it was run on -------------------------------------
     "benchmark",
-    "benchmark_group",
     "benchmark_item_id",
-    "benchmark_category",
-    "invocation_id",
-    # --- the specification and the call -----------------------------------
     "signature",
     "docstring",
-    "input_line",
     "inputs",
-    # --- outcome ----------------------------------------------------------
     "expected",
     "predicted",
     "correct",
     "scorable",
     "validation_status",
+    "structural_validity",
     "failure_type",
     "parse_status",
-    # --- self-checking (contract) -----------------------------------------
-    "contract_checked",
-    "contract_revised",
-    "revisions",
-    "pre_revision_value",
-    "pre_revision_correct",
-    # --- cost -------------------------------------------------------------
+    "parse_error",
+    "contract_status",
     "latency_ms",
     "input_tokens",
     "output_tokens",
     "total_tokens",
-    "model_calls",
     "retries",
-    "token_retries",
-    # --- provenance / diagnostics -----------------------------------------
-    "seed",
-    "manifest_version",
-    "dataset_revision",
     "invocation_pool",
     "return_type_source",
     "temperature",
     "top_p",
     "max_new_tokens",
-    "exec_status",
     "type_warnings",
     "raw_text",
     "prompts",
     "reasoning_requests",
     "reasoning_observations",
+    "answer_format",
+    "transport_diagnostics",
 ]
 
 
@@ -104,8 +77,7 @@ def _json(value: Any) -> str:
 def derive_failure_type(result: ExecuteResult, correct: bool) -> Optional[str]:
     """Classify a benchmark outcome without replacing explicit failures.
 
-    Validate existing failure labels first. If none is recorded, map known
-    generated-code execution failures, then use grader-supplied correctness.
+    Validate existing failure labels first, then use grader-supplied correctness.
     Scoring eligibility is determined separately when building the row.
     """
     # Validate explicit labels even when they are falsy or already excluded.
@@ -113,23 +85,40 @@ def derive_failure_type(result: ExecuteResult, correct: bool) -> Optional[str]:
     if result.failure_type:
         return result.failure_type
 
-    # Generation/execution failures remain scorable model outcomes rather
-    # than being excluded as provider failures.
-    codegen = {
-        "truncated": FailureType.GENERATED_CODE_TRUNCATED,
-        "syntax_error": FailureType.GENERATED_CODE_SYNTAX,
-        "runtime_error": FailureType.GENERATED_CODE_RUNTIME,
-        "timeout": FailureType.GENERATED_CODE_TIMEOUT,
-        # Legacy status from runs predating the split; it covered both
-        # syntax and runtime failures, so the less specific one is used.
-        "error": FailureType.GENERATED_CODE_RUNTIME,
-    }
-    if result.exec_status in codegen:
-        return codegen[result.exec_status]
-
     if not correct:
         return FailureType.SEMANTIC_WRONG_ANSWER
     return FailureType.SUCCESS
+
+
+def _reference_types_compatible(predicted, expected):
+    """Conservative top-level diagnostic; never changes grader correctness.
+
+    Numeric and collection representations may be equivalent under a frozen
+    grader. Nested value/type errors remain semantic wrong answers.
+    """
+    for family in ((int, float), (list, tuple, set, frozenset)):
+        if type(predicted) in family and type(expected) in family:
+            return True
+    return type(predicted) is type(expected)
+
+
+def _structural_validity(result, signature):
+    """Check only a public return annotation, without converting the answer."""
+    if (
+        result.parse_status not in (ParseOutcome.PARSED, ParseOutcome.FALLBACK)
+        or result.failure_type == FailureType.PARSE
+        or result.failure_type in FailureType.INFRASTRUCTURE
+        or result.validation_status == "unparsed"
+    ):
+        return "not_assessed"
+    try:
+        declared = parse_signature(signature)
+    except ValueError:
+        return "not_assessed"
+    if declared.return_type is Any or declared.return_type is None:
+        return "not_assessed"
+    warnings = validate_output(result.result, declared.return_type, strict=False)
+    return "invalid" if warnings else "valid"
 
 
 def build_row(
@@ -137,97 +126,79 @@ def build_row(
     *,
     run_id: str,
     benchmark: str,
-    benchmark_group: str,
     item_id: str,
     signature: str,
     docstring: str,
     inputs: Dict[str, Any],
     expected: Any,
     correct: bool,
-    seed: int,
-    manifest_version: Any,
-    category: Optional[str] = None,
-    invocation_id: Optional[str] = None,
-    input_line: str = "",
-    is_baseline: bool = False,
-    pre_revision_correct: Optional[bool] = None,
-    timestamp: Optional[str] = None,
-    dataset_revision: Optional[str] = None,
     invocation_pool: Optional[str] = None,
     return_type_source: Optional[str] = None,
     generation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble one schema-conformant result row."""
-    checked = result.revised is not None      # a check ran at all
+    contract_status = (
+        "not_checked" if result.revised is None
+        else "revised" if result.revised else "unchanged"
+    )
     failure = derive_failure_type(result, correct) or ""
+    structural_status = (
+        _structural_validity(result, signature)
+        if result.answer_format == FRAMED_TEXT_V1
+        else "not_assessed"
+    )
     if (
-        result.exec_status in ("truncated", "syntax_error", "runtime_error", "timeout", "error")
-        or failure in (
-            FailureType.PARSE,
-            FailureType.GENERATED_CODE_TRUNCATED,
-            FailureType.GENERATED_CODE_SYNTAX,
-            FailureType.GENERATED_CODE_RUNTIME,
-            FailureType.GENERATED_CODE_TIMEOUT,
-        )
+        result.answer_format == FRAMED_TEXT_V1
+        and failure == FailureType.SEMANTIC_WRONG_ANSWER
     ):
+        if structural_status == "invalid":
+            failure = FailureType.STRUCTURAL_VALIDATION
+        elif not _reference_types_compatible(result.result, expected):
+            failure = FailureType.REFERENCE_TYPE_MISMATCH
+    if failure == FailureType.PARSE:
         correct = False
     failure_scorable = FailureType.is_scorable(failure)
     gen = generation or {}
     return {
         "run_id": run_id,
-        "timestamp": timestamp or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model": result.model,
         "strategy": result.strategy,
-        "is_baseline": is_baseline,
         "benchmark": benchmark,
-        "benchmark_group": benchmark_group,
         "benchmark_item_id": item_id,
-        "benchmark_category": category or "",
-        "invocation_id": invocation_id or "",
         "signature": signature,
         "docstring": docstring,
-        "input_line": input_line,
         "inputs": _json(inputs),
         "expected": _json(expected),
         "predicted": _json(result.result),
         "correct": correct,
-        # Whether this invocation belongs in the capability denominator.
-        # A provider outage is not the model being wrong.
+        # Infrastructure failures do not enter capability accuracy.
         "scorable": result.scorable and failure_scorable,
         "validation_status": result.validation_status,
+        "structural_validity": structural_status,
         "failure_type": failure,
         "parse_status": result.parse_status or "",
-        "contract_checked": checked,
-        "contract_revised": result.revised if checked else "",
-        "revisions": int(bool(result.revised)) if checked else 0,
-        "pre_revision_value": _json(result.pre_revision_value) if checked else "",
-        "pre_revision_correct": "" if pre_revision_correct is None else pre_revision_correct,
+        "parse_error": result.parse_error or "",
+        "contract_status": contract_status,
         # Record integer milliseconds; missing latency currently defaults to zero.
         "latency_ms": round(result.latency_ms or 0.0),
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
         "total_tokens": result.total_tokens,
-        "model_calls": result.model_calls,
         "retries": result.retries,
-        "token_retries": result.token_retries,
-        "seed": seed,
-        "manifest_version": manifest_version,
-        "dataset_revision": dataset_revision or "",
         "invocation_pool": invocation_pool or "",
         "return_type_source": return_type_source or "",
-        # Resolved generation settings, recorded so a row states the
-        # configuration it was produced under rather than requiring the
-        # manifest to be consulted separately.
+        # Resolved generation settings for this row.
         "temperature": gen.get("temperature"),
         "top_p": gen.get("top_p"),
         "max_new_tokens": gen.get("max_new_tokens"),
-        "exec_status": result.exec_status or "",
         "type_warnings": "; ".join(result.type_warnings),
         "raw_text": result.raw_text,
         "prompts": _json(result.prompts),
         # Native settings sent for recorded responses, not verified reasoning mode.
         "reasoning_requests": _json(result.reasoning_requests),
         "reasoning_observations": _json(result.reasoning_observations),
+        "answer_format": result.answer_format,
+        "transport_diagnostics": _json(result.transport_diagnostics),
     }
 
 

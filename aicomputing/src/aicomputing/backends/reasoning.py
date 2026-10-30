@@ -19,14 +19,10 @@ class ReasoningCapabilities:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a nonempty string")
-        if self.parameter is not None and (
-            not isinstance(self.parameter, str) or not self.parameter.strip()
-        ):
-            raise ValueError("parameter must be a nonempty string or None")
-        if self.endpoint is not None and (
-            not isinstance(self.endpoint, str) or not self.endpoint.strip()
-        ):
-            raise ValueError("endpoint must be a nonempty string or None")
+        for name in ("parameter", "endpoint"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be a nonempty string or None")
         if self.support not in ("unknown", "supported", "unsupported"):
             raise ValueError("Invalid capability support state")
         if type(self.values) not in (tuple, list):

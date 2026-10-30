@@ -1,17 +1,12 @@
-"""Visible thinking-block cleanup shared by inference backends.
-
-This removes recognized leading text blocks, not a model's hidden computation.
-It does not enable, disable or verify native reasoning.
-"""
+"""Remove visible thinking blocks without controlling native reasoning."""
 
 from __future__ import annotations
 
 
 def strip_thinking(text: str) -> str:
-    """Remove leading <think>...</think> blocks from response text.
+    """Remove leading <think> blocks; an unclosed block yields empty text.
 
-    Return empty text if a leading block is unclosed or no final text remains.
-    Preserve occurrences of the tags within the remaining response text.
+    Tags within the remaining response are preserved.
     """
     if not text:
         return ""

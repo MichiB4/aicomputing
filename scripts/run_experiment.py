@@ -1,30 +1,12 @@
 #!/usr/bin/env python3
-"""
-Run every cell of an experiment manifest.
+"""Run manifest cells in separate processes, continuing after failed cells.
 
-A cell is one (model x benchmark x strategy). The manifest records item and
-invocation selections for comparisons within each benchmark. Results join on
-benchmark_item_id. Reusing a selection does not guarantee equal model outputs.
+The manifest fixes selections, seeds and sizes.
+Each child resolves IDs and verifies content before inference. Incomplete,
+unfingerprinted, or changed observations reject the cell; this orchestrator
+exposes no content-drift override.
 
-    pilot-v3       python scripts/run_experiment.py --manifest manifests/pilot-v3.json \\
-                       --provider groq --model qwen/qwen3.8-27b
-    main run       python scripts/run_experiment.py --manifest manifests/main-v2.json \\
-                       --provider groq --model <id>
-
-Cells run in separate processes, one per cell, for the same reason the earlier
-runners did: a crash, a rate limit, or an OOM in one cell must not take the
-rest of the run with it. A failed cell is reported and the run continues.
-
-The code-generation baseline is scheduled only on the benchmarks the manifest
-lists for it (HumanEval+ and MBPP+); it is never run on GSM8K or BBH.
-
-This script does NOT decide sample sizes, seeds, or item selection. Those live
-in the manifest, built by scripts/make_manifest.py. Each cell resolves the
-recorded IDs and verifies selected content before model execution. Incomplete
-coverage, missing fingerprints or changed content reject the cell. The direct
-benchmark runner has an explicit debug drift override; this orchestrator does
-not expose it.
-"""
+Example: python scripts/run_experiment.py --manifest PATH_TO_MANIFEST.json"""
 
 from __future__ import annotations
 
@@ -43,26 +25,21 @@ for path in (_BENCH, os.path.join(_PKG, "src")):
         sys.path.insert(0, path)
 
 from experiment import (  # noqa: E402
-    BASELINE_NAME, load_manifest, resolve_model_connection, resolve_reasoning_settings,
+    load_manifest, resolve_model_connection, resolve_reasoning_settings,
     resolve_generation_settings,
 )
 
 RUN_BENCHMARK = os.path.join(_BENCH, "run_benchmark.py")
 
-def cells(manifest, models, strategies=None, benchmarks=None, with_baseline=True):
-    """Enumerate (model, benchmark, strategy, is_baseline) in a stable order."""
+def cells(manifest, models, strategies=None, benchmarks=None):
+    """Enumerate (model, benchmark, strategy) in a stable order."""
     strategies = strategies or manifest["strategies"]
     benchmarks = benchmarks or list(manifest["benchmarks"])
-    baseline = manifest.get("baseline")
     out = []
     for model in models:
         for strategy in strategies:
             for bench in benchmarks:
-                out.append((model, bench, strategy, False))
-        if with_baseline and baseline:
-            for bench in baseline["benchmarks"]:
-                if bench in benchmarks:
-                    out.append((model, bench, BASELINE_NAME, True))
+                out.append((model, bench, strategy))
     return out
 
 
@@ -77,9 +54,8 @@ def main() -> int:
     ap.add_argument("--api-key", default=None)
     ap.add_argument("--strategies", nargs="+", default=None)
     ap.add_argument("--benchmarks", nargs="+", default=None)
-    ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("--out-dir", default=None,
-                    help="Default: results/<experiment_id>/")
+                    help="Default: runs/<experiment_id>/")
     ap.add_argument("--limit", type=int, default=None,
                     help="Debug only: first N manifest items per cell.")
     ap.add_argument("--dry-run", action="store_true",
@@ -131,13 +107,12 @@ def main() -> int:
         print("This debug run is not manifest-reproducible and must not be reported.")
 
     out_dir = os.path.abspath(
-        args.out_dir or os.path.join(_ROOT, "aicomputing", "results", experiment_id))
+        args.out_dir or os.path.join(_ROOT, "runs", experiment_id))
 
-    plan = cells(manifest, models, args.strategies, args.benchmarks,
-                 with_baseline=not args.no_baseline)
+    plan = cells(manifest, models, args.strategies, args.benchmarks)
     output_paths, seen_outputs = [], {}
     for cell in plan:
-        model, bench, strategy, _ = cell
+        model, bench, strategy = cell
         safe_model = "".join(c if c.isalnum() or c in "-._" else "-" for c in model)
         out_csv = os.path.join(out_dir, f"{safe_model}__{bench}__{strategy}.csv")
         path_key = os.path.normcase(os.path.abspath(out_csv))
@@ -156,26 +131,21 @@ def main() -> int:
     print(f"results -> {out_dir}\n")
 
     if args.dry_run:
-        for i, (model, bench, strat, is_base) in enumerate(plan, 1):
-            tag = " [baseline]" if is_base else ""
-            print(f"  [{i:>3}/{len(plan)}] {model}  {bench} x {strat}{tag}")
+        for i, (model, bench, strat) in enumerate(plan, 1):
+            print(f"  [{i:>3}/{len(plan)}] {model}  {bench} x {strat}")
         return 0
 
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     failed, started = [], time.time()
 
     for i, (cell, out_csv) in enumerate(zip(plan, output_paths), 1):
-        model, bench, strategy, is_baseline = cell
-        tag = " [baseline]" if is_baseline else ""
-        print(f"[{i}/{len(plan)}] {model}  {bench} x {strategy}{tag} " + "-" * 20, flush=True)
+        model, bench, strategy = cell
+        print(f"[{i}/{len(plan)}] {model}  {bench} x {strategy} " + "-" * 20, flush=True)
 
         cmd = [sys.executable, RUN_BENCHMARK,
                "--benchmark", bench, "--manifest", os.path.abspath(args.manifest),
                "--model", model, "--out", out_csv]
-        if is_baseline:
-            cmd.append("--baseline")
-        else:
-            cmd += ["--strategy", strategy]
+        cmd += ["--strategy", strategy]
         # Frozen connection/native settings are read directly by the child.
         if model in unfrozen:
             cmd.append("--allow-unfrozen-model-config")

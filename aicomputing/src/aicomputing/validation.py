@@ -1,9 +1,4 @@
-"""
-Runtime type-checking and constraint validation for AI Computing.
-
-Checks inputs against declared parameter types, outputs against expected
-return types, and outputs against caller-supplied constraint predicates.
-"""
+"""Validate declared input/output types and caller-supplied output predicates."""
 
 from __future__ import annotations
 
@@ -17,22 +12,10 @@ from .types import MediaObject, ParsedSignature, validate_type_annotation
 # Output validation policy.
 
 class ValidationMode(Enum):
-    """
-    How the runtime handles outputs that fail type or constraint validation.
+    """Output policy after retries: STRICT withholds invalid values; WARN returns them.
 
-    STRICT
-        After the retry loop ends, invalid outputs are withheld. The runtime
-        returns an ExecuteResult with result=None and failure diagnostics
-        rather than raising for these output-validation failures.
-
-    WARN
-        Invalid outputs are returned with warnings and failure diagnostics.
-
-    Passing validation means the output passed the applicable checks.
-    It does not establish that the prediction satisfies the specification.
-
-    Model-based self-checking is separate from these mechanical checks
-    and does not establish semantic correctness.
+    Both report diagnostics without raising for output-validation failures.
+    Mechanical validation and model self-checking do not establish correctness.
     """
 
     STRICT = "strict"
@@ -44,11 +27,9 @@ class ValidationMode(Enum):
         value: ValidationMode | str | bool | None,
         default: ValidationMode | None = None,
     ) -> ValidationMode:
-        """
-        Resolve a mode, string value, or legacy boolean.
+        """Resolve modes, strings, or legacy booleans (True=STRICT, False=WARN).
 
-        True selects STRICT; False selects WARN.
-        None uses the supplied default, falling back to WARN.
+        None uses default, falling back to WARN.
         """
         if value is None:
             return default if default is not None else cls.WARN
@@ -91,13 +72,9 @@ def _is_media_type(t: Any) -> bool:
 
 
 def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
-    """
-    Check a value against a supported type annotation.
+    """Check supported scalar/container/media annotations; mismatches raise AITypeError.
 
-    Raises AITypeError on a detected mismatch.
-
-    Supports primitive and container types, generic lists, dictionaries,
-    tuples and sets, NoneType, Any, and MediaObject subclasses.
+    Generic lists, dictionaries, tuples and sets are checked recursively.
     """
     validate_type_annotation(expected)
     if expected is Any:
@@ -191,11 +168,10 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
 # Input validation.
 
 def validate_media_inputs(inputs: Dict[str, Any]) -> None:
-    """Reject MediaObject wrappers, including Text, in nested input containers.
+    """Reject media wrappers, including Text, in cycle-safe nested containers.
 
-    Inspect dictionary keys and values and list/tuple/set/frozenset contents.
-    Do not inspect arbitrary object attributes or infer media from strings or
-    raw bytes. Track visited containers so cycles do not stall this check.
+    Inspect dict keys/values and list/tuple/set/frozenset contents, not arbitrary
+    attributes. Ordinary strings and bytes are not interpreted as media.
     """
     pending = [inputs]
     seen: set[int] = set()
@@ -226,11 +202,9 @@ def validate_inputs(
     inputs: Dict[str, Any],
     strict: bool = True,
 ) -> List[str]:
-    """
-    Check supplied argument names and values against a parsed signature.
+    """Check argument names and types against the signature.
 
-    Returns warning strings in permissive mode.
-    Strict mode raises AITypeError on the first detected mismatch.
+    Strict raises on the first mismatch; permissive returns warnings.
     """
     warnings: List[str] = []
     declared_names = {p.name for p in sig.params}
@@ -276,12 +250,9 @@ def validate_output(
     return_type: Any,
     strict: bool = True,
 ) -> List[str]:
-    """
-    Check an output against an expected type annotation.
+    """Check output types: strict raises AITypeError; permissive returns warnings.
 
-    Any or None disables this check; type(None) requires a None value.
-    Strict mode raises AITypeError on a detected mismatch.
-    Permissive mode returns the mismatch as a warning.
+    Any/None disables checks; type(None) requires a None value.
     """
     if return_type is Any or return_type is None:
         return []
@@ -313,11 +284,8 @@ def validate_constraints(
     constraints: List[Constraint],
     strict: bool = True,
 ) -> List[str]:
-    """
-    Check an output using caller-supplied predicates.
+    """Apply predicates: strict raises AIConstraintError; permissive returns failures.
 
-    Returns failure diagnostics in permissive mode.
-    Strict mode raises AIConstraintError when a predicate returns a false value.
     Predicate exceptions propagate unchanged in either mode.
     """
     failures: List[str] = []

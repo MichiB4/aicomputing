@@ -1,12 +1,7 @@
-"""Typed JSON values shared by the offline MBPP builder and cache loader."""
+"""Typed JSON values for frozen benchmark inputs and targets."""
 
 import json
 import math
-
-
-# Increment when construction or value encoding changes.
-GROUND_TRUTH_VERSION = 3
-VALUE_ENCODING = "typed-v1"
 
 
 def encode_value(value):

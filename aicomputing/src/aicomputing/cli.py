@@ -20,6 +20,7 @@ import json
 import sys
 
 from .request import ExecuteRequest
+from .answer_protocol import ANSWER_FORMATS, FRAMED_TEXT_V1, LEGACY
 from .runtime import VirtualRuntime
 from .strategies import list_strategies
 
@@ -39,6 +40,9 @@ def main(argv=None):
     p.add_argument("--base-url", default=None, help="OpenAI API base URL or Ollama host")
     p.add_argument("--api-key", default=None, help="API key (for openai backend)")
     p.add_argument("--strategy", default="direct", choices=list_strategies())
+    p.add_argument("--answer-format", choices=ANSWER_FORMATS, default=LEGACY,
+                   help=("Use framed_v1 or framed_text_v1 for explicit final-answer boundaries; "
+                         "framed_text_v1 disables validation retries"))
     p.add_argument("--temp", type=float, default=0.0)
     p.add_argument("--max-tokens", type=int, default=None, dest="max_tokens",
                help=("Optional starting output-token allowance; omitted means no application cap. "
@@ -90,44 +94,46 @@ def main(argv=None):
     if args.api_key:
         backend_kwargs["api_key"] = args.api_key
 
-    vr = VirtualRuntime(
+    with VirtualRuntime(
         backend=args.backend,
         model=args.model,
         strategy=args.strategy,
         strict_types=not args.no_strict,
         trace_file=args.trace,
         **backend_kwargs,
-    )
+    ) as vr:
 
-    req = ExecuteRequest(
-        signature=args.signature,
-        docstring=args.docstring,
-        inputs=json.loads(args.inputs),
-        return_type=return_type,
-        temperature=args.temp,
-        max_new_tokens=args.max_tokens,
-        strict_types=not args.no_strict,
-    )
+        req = ExecuteRequest(
+            signature=args.signature,
+            docstring=args.docstring,
+            inputs=json.loads(args.inputs),
+            return_type=return_type,
+            temperature=args.temp,
+            max_new_tokens=args.max_tokens,
+            answer_format=args.answer_format,
+            max_retries=0 if args.answer_format == FRAMED_TEXT_V1 else 1,
+            strict_types=not args.no_strict,
+        )
 
-    res = vr.execute(req)
+        res = vr.execute(req)
 
-    # Output
-    try:
-        output = json.dumps(res.result, ensure_ascii=False, default=str)
-    except TypeError:
-        output = repr(res.result)
-    print(output)
+        # Output
+        try:
+            output = json.dumps(res.result, ensure_ascii=False, default=str)
+        except TypeError:
+            output = repr(res.result)
+        print(output)
 
-    if args.verbose:
-        print(f"[strategy] {res.strategy}", file=sys.stderr)
-        print(f"[model]    {res.model}", file=sys.stderr)
-        print(f"[latency]  {res.latency_ms:.0f}ms", file=sys.stderr)
-        print(f"[tokens]   {res.tokens_used}", file=sys.stderr)
-        print(f"[retries]  {res.retries}", file=sys.stderr)
-        print(f"[reasoning_requests] {res.reasoning_requests}", file=sys.stderr)
-        if res.type_warnings:
-            print(f"[type_warn] {res.type_warnings}", file=sys.stderr)
-        print(f"[raw] {res.raw_text}", file=sys.stderr)
+        if args.verbose:
+            print(f"[strategy] {res.strategy}", file=sys.stderr)
+            print(f"[model]    {res.model}", file=sys.stderr)
+            print(f"[latency]  {res.latency_ms:.0f}ms", file=sys.stderr)
+            print(f"[tokens]   {res.tokens_used}", file=sys.stderr)
+            print(f"[retries]  {res.retries}", file=sys.stderr)
+            print(f"[reasoning_requests] {res.reasoning_requests}", file=sys.stderr)
+            if res.type_warnings:
+                print(f"[type_warn] {res.type_warnings}", file=sys.stderr)
+            print(f"[raw] {res.raw_text}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
-"""
-Abstract strategy interface for AI Computing.
+"""Strategy interface, shared prediction calls, and response accounting.
 
-Registered strategies predict outputs from specifications and inputs without
-executing generated implementations. The code-generation comparison baseline
-also implements this interface but is supplied explicitly outside the registry.
+Strategies predict values without executing generated implementations. Native
+reasoning follows backend configuration.
+
+None leaves output uncapped by the application. Truncation retries double an
+explicit allowance up to five times; provider limits still apply. Runtime
+validation retries are separate.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import Any, Callable, List, Optional
 
 from ..backends.base import Backend, GenerateResponse
 from ..parsing import parse_result_detailed
+from ..prompting import build_retry_prompt
 from ..request import ExecuteRequest
 from ..validation import ValidationMode
 
@@ -28,24 +31,16 @@ _MAX_RETRIES = 5
 
 @dataclass
 class CallStats:
-    """
-    Accumulate model-call counts, reported usage, and requested settings.
+    """Accumulate explicitly recorded responses, including all stages and retries.
 
-    Strategies share one instance across their calls, including token-budget
-    retries, contract checks, and consistency samples. Each response must be
-    recorded explicitly.
-
-    Token counts remain None until reported. Zero represents a reported
-    count of zero.
+    Token counts remain None until reported; zero means a reported zero.
     """
 
     model_calls: int = 0
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
 
-    # One snapshot per recorded response, in call order, including retries.
-    # None means unrecorded settings; {} means no native override was sent.
-    # These records do not establish the provider's actual reasoning mode.
+    # Response-order snapshots: None = unrecorded, {} = omitted; not actual mode.
     reasoning_requests: List[Optional[dict[str, Any]]] = field(default_factory=list)
 
     # False once any recorded response omits the corresponding token count.
@@ -55,6 +50,7 @@ class CallStats:
 
     # One snapshot per returned response; None means no observations recorded.
     reasoning_observations: List[Optional[dict[str, Any]]] = field(default_factory=list)
+    transport_diagnostics: List[Optional[dict[str, Any]]] = field(default_factory=list)
 
     def record(self, response: "GenerateResponse") -> "CallStats":
         """Record usage, native requests, and response observations separately."""
@@ -66,6 +62,7 @@ class CallStats:
         self.reasoning_observations.append(
             deepcopy(getattr(response, "observed_reasoning", None))
         )
+        self.transport_diagnostics.append(deepcopy(getattr(response, "transport_diagnostics", None)))
         raw_in = getattr(response, "input_tokens", None)
         raw_out = getattr(response, "output_tokens", None)
         if raw_out is None:
@@ -81,12 +78,7 @@ class CallStats:
 
     @property
     def total_tokens(self) -> Optional[int]:
-        """
-        Return total token usage when both components are complete.
-
-        Return None if any recorded response omitted input or output usage,
-        or if no counts have been reported.
-        """
+        """Return total usage, or None if either component is missing/incomplete."""
         if not (self.input_complete and self.output_complete):
             return None
         if self.input_tokens is None or self.output_tokens is None:
@@ -109,28 +101,21 @@ class StrategyResult:
     value: Any
     raw_text: str
 
-    # Prompt texts recorded by the strategy, in stage order.
-    # Repeated sampling and token-budget retries are not separate entries.
+    # Stage-order prompts; repeated samples/token retries are not separate entries.
     prompts: List[str] = field(default_factory=list)
 
     tokens_used: Optional[int] = None
 
-    # Final requested output-token limit; None means no application cap.
-    # Contract and consistency report None if any stage/sample was uncapped,
-    # otherwise the maximum final limit. Custom strategies may leave it unset.
+    # Final allowance, or None if uncapped/unrecorded. Multiple stages/samples
+    # report their maximum unless any was uncapped.
     token_budget_used: Optional[int] = None
     retries: int = 0
 
     # Strategy selected by hybrid, when applicable.
     substrategy: Optional[str] = None
 
-    # Original provider finish reason for the response surfaced by the strategy.
-    # This is not a complete history for strategies making multiple calls.
+    # Original reason for the selected response, not a complete call history.
     provider_finish_reason: Optional[str] = None
-
-    # Code-generation/execution status, including "truncated" before execution.
-    # None when no execution status is supplied.
-    exec_status: Optional[str] = None
 
     # Accumulated model-call accounting, when supplied by the strategy.
     call_stats: Optional[CallStats] = None
@@ -142,8 +127,7 @@ class StrategyResult:
     # Contract checker verdict parsing, separate from answer parsing.
     verdict_parse_status: Optional[str] = None
 
-    # Whether a revision step changed the candidate value.
-    # None means no revision step is reported.
+    # Whether revision changed the candidate; None if no check was reported.
     revised: Optional[bool] = None
 
     # Original candidate before revision, when applicable.
@@ -159,11 +143,9 @@ class Strategy(ABC):
         """Short identifier, e.g. 'direct', 'cot', 'code_gen'."""
 
     def cache_state(self) -> dict[str, Any]:
-        """Describe configuration for the runtime's cache key.
+        """Describe cache configuration; unsupported values bypass caching.
 
-        Unsupported values cause the cache to bypass the request.
-        Strategies owning other strategies can describe their delegates
-        explicitly instead of including the delegate objects themselves.
+        Represent delegates by their configuration rather than strategy objects.
         """
         return vars(self).copy()
 
@@ -174,13 +156,63 @@ class Strategy(ABC):
         backend: Backend,
         feedback: Optional[dict] = None,
     ) -> StrategyResult:
-        """
-        Produce a prediction and diagnostics using the supplied backend.
+        """Predict with the supplied backend.
 
-        On validation retries, feedback contains the previous raw response
-        and validation message under "raw_output" and "error". Strategies
-        use this information when constructing their retry prompts.
+        Retry feedback carries the previous response and validation message
+        under "raw_output" and "error".
         """
+
+
+def _execute_prompt(
+    request: ExecuteRequest,
+    backend: Backend,
+    prompt: str,
+    feedback: Optional[dict] = None,
+) -> StrategyResult:
+    """Generate and parse one prediction prompt, preserving retries and accounting."""
+    if feedback:
+        prompt = build_retry_prompt(
+            original_prompt=prompt,
+            raw_output=feedback.get("raw_output", ""),
+            error_message=feedback.get("error", ""),
+            answer_format=request.answer_format,
+        )
+
+    initial_budget = request.max_new_tokens
+
+    def call(max_new_tokens: Optional[int]):
+        return backend.generate(
+            prompt,
+            model=request.model,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            max_new_tokens=max_new_tokens,
+        )
+
+    psink: dict = {}
+    parse = make_parser(request.return_type, _is_strict(request), psink, answer_format=request.answer_format)
+
+    stats = CallStats()
+    value, response, retries, final_budget = generate_with_retry(
+        call=call,
+        parse=parse,
+        initial_budget=initial_budget,
+        model_name=request.model or backend.default_model,
+        stats=stats,
+    )
+
+    return StrategyResult(
+        value=value,
+        raw_text=response.text,
+        prompts=[prompt],
+        tokens_used=response.tokens_used,
+        provider_finish_reason=response.provider_finish_reason,
+        token_budget_used=final_budget,
+        retries=retries,
+        call_stats=stats,
+        parse_status=psink.get("parse_status"),
+        parse_error=psink.get("parse_error"),
+    )
 
 
 def generate_with_retry(
@@ -190,30 +222,14 @@ def generate_with_retry(
     stats: Optional["CallStats"] = None,
     model_name: str = "",
 ) -> tuple[Any, GenerateResponse, int, Optional[int]]:
-    """
-    Retry token-limited responses with increasing output-token budgets.
+    """Double explicit token allowances after finish_reason="length".
 
-    Only responses with finish_reason="length" and an explicit integer
-    budget trigger a retry. None requests no application cap, so a provider
-    output or context limit cannot be expanded here and is not retried.
-    Truncated prefixes are never parsed. Other responses are parsed once.
-    Parser exceptions propagate unchanged.
-    A parser may return None as a valid value; this function does not
-    distinguish it from a returned None representing failed recovery.
+    Uncapped calls cannot expand provider limits and are not retried here.
+    Record every returned response in stats. Never parse truncated text;
+    parse other responses once and propagate parser exceptions.
 
-    Args:
-        call: Generate a response using the supplied output-token budget.
-        parse: Recover a Python value from response text.
-        initial_budget: Positive starting budget, or None for no application cap.
-            Retries may exceed an explicit starting budget.
-        stats: Optional accumulator for each returned backend response.
-        model_name: Model identifier used in log messages.
-
-    Returns:
-        A tuple of (value, final_response, retries, final_budget).
-        retries counts additional calls after the first, regardless of
-        success. final_budget is the limit requested for the final call,
-        or None when no application cap was requested.
+    Return (value, final_response, additional_calls, final_requested_budget).
+    A parsed None may be valid; callers track recovery status separately.
     """
     if initial_budget is not None:
         if type(initial_budget) is not int:
@@ -318,21 +334,17 @@ def _accumulate(total: "CallStats", part: "Optional[CallStats]") -> "CallStats":
     total.output_tokens = _add_optional(total.output_tokens, part.output_tokens)
     total.reasoning_requests.extend(deepcopy(part.reasoning_requests))
     total.reasoning_observations.extend(deepcopy(part.reasoning_observations))
+    total.transport_diagnostics.extend(deepcopy(part.transport_diagnostics))
     # Any incomplete component keeps the aggregate component incomplete.
     total.input_complete = total.input_complete and part.input_complete
     total.output_complete = total.output_complete and part.output_complete
     return total
 
 
-def make_parser(return_type, strict: bool, sink: dict):
-    """
-    Build a parser callback that stores recovery diagnostics in sink.
-
-    Each completed parse replaces sink's parse_status and parse_error.
-    The caller associates those diagnostics with the corresponding value.
-    """
+def make_parser(return_type, strict: bool, sink: dict, *, answer_format="legacy"):
+    """Parse values and replace sink's parse_status/parse_error on each call."""
     def parse(text: str):
-        outcome = parse_result_detailed(text, return_type, strict=strict)
+        outcome = parse_result_detailed(text, return_type, strict=strict, answer_format=answer_format)
         sink["parse_status"] = outcome.status
         sink["parse_error"] = outcome.error
         return outcome.value
@@ -341,12 +353,9 @@ def make_parser(return_type, strict: bool, sink: dict):
 
 
 def _is_strict(request) -> bool:
-    """
-    Resolve the request's STRICT flag for existing parser call sites.
+    """Resolve validation_mode, then strict_types, otherwise WARN.
 
-    Prefer validation_mode, then strict_types, and otherwise use WARN.
-    Runtime supplies its resolved output policy in validation_mode.
-    Limited conversion rules no longer depend on this flag.
+    Retained for parser compatibility; conversion rules are policy-independent.
     """
     mode = getattr(request, "validation_mode", None)
     if mode is None:

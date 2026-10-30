@@ -5,13 +5,13 @@ Quick start::
 
     from aicomputing import VirtualRuntime, ExecuteRequest
 
-    vr = VirtualRuntime(backend="ollama", model="qwen3:4b")
-    result = vr.execute(ExecuteRequest(
-        signature="sort(arr: list[int]) -> list[int]",
-        docstring="Return a sorted copy of the array.",
-        inputs={"arr": [5, 3, 1, 4]},
-        return_type=list,
-    ))
+    with VirtualRuntime(backend="ollama", model="qwen3:4b") as vr:
+        result = vr.execute(ExecuteRequest(
+            signature="sort(arr: list[int]) -> list[int]",
+            docstring="Return a sorted copy of the array.",
+            inputs={"arr": [5, 3, 1, 4]},
+            return_type=list,
+        ))
     print(result.result)  # [1, 3, 4, 5]
 """
 

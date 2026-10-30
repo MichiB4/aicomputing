@@ -58,12 +58,14 @@ class SelfConsistencyStrategy(Strategy):
             docstring=request.docstring,
             inputs=request.inputs,
             include_fewshot=self._include_fewshot,
+            answer_format=request.answer_format,
         )
         if feedback:
             prompt = build_retry_prompt(
                 original_prompt=prompt,
                 raw_output=feedback.get("raw_output", ""),
                 error_message=feedback.get("error", ""),
+                answer_format=request.answer_format,
             )
 
         # None leaves output length to the provider rather than a strategy cap.
@@ -86,7 +88,7 @@ class SelfConsistencyStrategy(Strategy):
             # A fresh sink prevents another sample from overwriting the
             # parsing status of the answer eventually selected by voting.
             psink: dict = {}
-            parse = make_parser(request.return_type, strict, psink)
+            parse = make_parser(request.return_type, strict, psink, answer_format=request.answer_format)
             value, response, retries, final_budget = generate_with_retry(
                 call=call,
                 parse=parse,

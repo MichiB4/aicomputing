@@ -1,11 +1,7 @@
 """Uncapped generation defaults and static provider presets.
 
-Model names and prompting strategies do not impose output allowances.
-Explicit caller limits and provider/model capacities still apply.
-Native reasoning controls are configured independently.
-
-Provider presets contain static connection settings and example model IDs;
-they do not verify current model availability or account limits.
+Explicit token limits and provider capacities still apply. Presets contain
+example model IDs, not verified availability or account limits.
 """
 
 from __future__ import annotations
@@ -13,25 +9,13 @@ from __future__ import annotations
 from typing import Optional
 
 
-# No application-imposed output allowance unless the caller requests one.
 DEFAULT_MAX_NEW_TOKENS: Optional[int] = None
 
 
 def get_token_budget(model: str, extended: bool) -> Optional[int]:
-    """Return the uncapped default through the legacy configuration helper.
-
-    The arguments remain accepted for callers using the existing interface.
-    Native reasoning is configured independently of the output allowance.
-    """
+    """Return the uncapped default; arguments are retained for compatibility."""
     return DEFAULT_MAX_NEW_TOKENS
 
-
-# ---------------------------------------------------------------------------
-# Provider presets
-#
-# Static endpoint settings and example model IDs for benchmark convenience.
-# Model availability and account limits must be checked with each provider.
-# ---------------------------------------------------------------------------
 
 PROVIDER_PRESETS: dict[str, dict] = {
     "groq": {
@@ -100,14 +84,13 @@ PROVIDER_PRESETS: dict[str, dict] = {
 
 
 def get_provider_preset(provider: str) -> Optional[dict]:
-    """Look up a registered provider name case-insensitively.
+    """Look up a provider case-insensitively, returning None if unknown.
 
-    Return None if the name is unregistered. The returned dictionary is
-    shared with PROVIDER_PRESETS; modifying it changes the registry.
+    The returned dictionary is shared with PROVIDER_PRESETS.
     """
     return PROVIDER_PRESETS.get(provider.lower())
 
 
 def list_providers() -> list[str]:
     """Return registered provider names in registry insertion order."""
-    return list(PROVIDER_PRESETS.keys())
+    return list(PROVIDER_PRESETS)

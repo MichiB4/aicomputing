@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Optional, Tuple
 
 from ..backends.base import Backend
+from ..answer_protocol import FRAMED_TEXT_V1
 from ..parsing import ParseOutcome, coerce_type, parse_result_detailed
 from ..prompting import (
     build_contract_check_prompt,
@@ -70,10 +71,10 @@ class ContractStrategy(Strategy):
         psink: dict = {}
         vsink: dict = {}
         strict = _is_strict(request)
-        parse = make_parser(request.return_type, strict, psink)
+        parse = make_parser(request.return_type, strict, psink, answer_format=request.answer_format)
 
         def parse_verdict(text: str):
-            outcome = _parse_verdict(text)
+            outcome = _parse_verdict(text, answer_format=request.answer_format)
             vsink["parse_status"] = outcome.status
             vsink["parse_error"] = outcome.error
             return outcome.value
@@ -84,12 +85,14 @@ class ContractStrategy(Strategy):
             docstring=request.docstring,
             inputs=request.inputs,
             include_fewshot=self._include_fewshot,
+            answer_format=request.answer_format,
         )
         if feedback:
             predict_prompt = build_retry_prompt(
                 original_prompt=predict_prompt,
                 raw_output=feedback.get("raw_output", ""),
                 error_message=feedback.get("error", ""),
+                answer_format=request.answer_format,
             )
 
         # Accumulate returned-response usage across both stages and retries.
@@ -114,6 +117,7 @@ class ContractStrategy(Strategy):
             inputs=request.inputs,
             candidate=candidate,
             include_fewshot=self._include_fewshot,
+            answer_format=request.answer_format,
         )
 
         (
@@ -142,11 +146,11 @@ class ContractStrategy(Strategy):
             and "result" in verdict_object
         )
         answer_parse_status = (
-            ParseOutcome.PARSED if replacement_supplied
+            vsink.get("parse_status", ParseOutcome.PARSED) if replacement_supplied
             else psink.get("parse_status")
         )
         answer_parse_error = (
-            None if replacement_supplied else psink.get("parse_error")
+            vsink.get("parse_error") if replacement_supplied else psink.get("parse_error")
         )
 
         tokens = _sum_optional(
@@ -179,10 +183,13 @@ class ContractStrategy(Strategy):
         )
 
 
-def _parse_verdict(check_text: str) -> ParseOutcome:
+def _parse_verdict(check_text: str, *, answer_format="legacy") -> ParseOutcome:
     """Recover and validate a complete contract verdict without unwrapping it."""
-    outcome = parse_result_detailed(check_text, unwrap_result=False)
-    if outcome.status != ParseOutcome.PARSED:
+    outcome = parse_result_detailed(check_text, unwrap_result=False, answer_format=answer_format)
+    recovered = outcome.status == ParseOutcome.PARSED or (
+        answer_format == FRAMED_TEXT_V1 and outcome.status == ParseOutcome.FALLBACK
+    )
+    if not recovered:
         return ParseOutcome(
             None, ParseOutcome.FAILED,
             outcome.error or "no structured verdict found",
@@ -196,7 +203,7 @@ def _parse_verdict(check_text: str) -> ParseOutcome:
     verdict = verdict.lower()
     if verdict == "revise" and "result" not in obj:
         return ParseOutcome(None, ParseOutcome.FAILED, "revision has no result field")
-    return ParseOutcome({**obj, "verdict": verdict}, ParseOutcome.PARSED)
+    return ParseOutcome({**obj, "verdict": verdict}, outcome.status, outcome.error)
 
 
 def _apply_verdict(

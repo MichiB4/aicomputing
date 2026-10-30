@@ -23,24 +23,12 @@ aicomputing/tests/
 aicomputing/docs/
 aicomputing/smoke_test.py
 
-# Development / obsolete experiment utilities
-scripts/debug_raw.py
-scripts/ollama_diagnostic.py
-scripts/run_quick_benchmarks.py
-scripts/run_evaluation.py
-scripts/make_tables.py
-
-# Legacy benchmark outside the final experiment
-aicomputing/benchmarks/hotpotqa_oracle.py
-
-# Local finalized-run manifest
-manifests/pilot-v2-run.json
-
 # Editor / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+/Microsoft/
 
 # Local project exports
 *.zip
@@ -48,6 +36,15 @@ Thumbs.db
 # Local re-root backup files
 pre-reroot-*
 
-# Extracted and obsolete MBPP caches; publish gzip and checksum
-data/mbpp_plus_ground_truth.json
-data/mbpp_plus_ground_truth.v1.backup.json
+# Local evaluation outputs and publication workspace
+/.publish/
+/runs/
+/results/
+/aicomputing/results/
+/exports/
+/data/
+/tests/
+/scripts/verify_experiment.py
+
+# Locally prepared, self-contained experiment inputs
+/manifests/prepared/
