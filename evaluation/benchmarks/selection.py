@@ -1,10 +1,12 @@
 """Deterministic, seeded item and invocation selection.
 
-Pools are deduplicated and sorted. Reordering an unchanged pool preserves
-selection; changing pool contents or invocation ordering can change it.
+Pools are deduplicated, sorted, then shuffled once per seed and salt. Taking
+prefixes gives nested samples without favoring lexicographically early IDs.
+Reordering an unchanged pool preserves selection; changing pool contents or
+invocation ordering can change it.
 BLAKE2b-derived seeds avoid process-dependent Python string hashes.
 
-Manifests record SELECTION_ALGORITHM_VERSION for compatibility."""
+Results record SELECTION_ALGORITHM_VERSION."""
 
 from __future__ import annotations
 
@@ -13,7 +15,7 @@ import random
 from typing import List, Sequence
 
 # Increment when selection or fingerprint rules change.
-SELECTION_ALGORITHM_VERSION = 4
+SELECTION_ALGORITHM_VERSION = 5
 
 
 def _derive_seed(seed: int, *parts: str) -> int:
@@ -45,16 +47,18 @@ def derive_index(seed: int, item_id: str, n: int, *, salt: str = "invocation") -
 
 def select_items(item_ids: Sequence[str], k: int, seed: int,
                  *, salt: str = "items") -> List[str]:
-    """Return up to k unique IDs, sorted; k must be a nonnegative integer.
+    """Return up to k unique IDs in seeded random order.
 
-    Sampling is order-independent for unchanged pools. k >= pool size returns all."""
+    k must be a nonnegative integer. Every size is a prefix of the same
+    shuffled pool, including k >= pool size. Candidate ordering and duplicates
+    do not affect the result.
+    """
     if type(k) is not int:
         raise TypeError("k must be an integer")
     if k < 0:
         raise ValueError("k must be non-negative")
 
     pool = sorted(set(item_ids))
-    if k >= len(pool):
-        return pool
     rng = random.Random(_derive_seed(seed, salt))
-    return sorted(rng.sample(pool, k))
+    rng.shuffle(pool)
+    return pool[:k]

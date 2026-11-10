@@ -1,10 +1,10 @@
 """Append invocation evidence as JSONL; write failures warn without stopping predictions.
 
 Cache hits record cached=true and zero tokens. Token counts for uncached calls
-use legacy strategy accounting and may omit earlier attempts. Reasoning requests
+accumulate returned responses across stages and validation retries. Reasoning requests
 preserve response order but do not establish the model's actual reasoning mode.
 
-Enable with VirtualRuntime(trace_file="trace.jsonl").
+Enable with VirtualRuntime(backend="ollama", trace_file="trace.jsonl").
 """
 
 from __future__ import annotations
@@ -12,12 +12,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+from .request import ExecuteRequest, ExecuteResult
 
 
 logger = logging.getLogger("aicomputing")
+_USE_RESULT = object()
 
 
 class Tracer:
@@ -30,72 +34,35 @@ class Tracer:
 
     def log(
         self,
-        signature: str,
-        docstring: str,
-        inputs: Dict[str, Any],
-        raw_text: str,
-        parsed_result: Any,
-        model: str,
-        strategy: str,
-        latency_ms: float,
-        tokens_used: Optional[int] = None,
-        token_budget_used: Optional[int] = None,
-        cached: bool = False,
-        retries: int = 0,
-        reasoning_requests: Optional[List[Optional[Dict[str, Any]]]] = None,
-        substrategy: Optional[str] = None,
-        revised: Optional[bool] = None,
-        pre_revision_value: Any = None,
-        provider_finish_reason: Optional[str] = None,
-        prompts: Optional[List[str]] = None,
-        input_warnings: Optional[List[str]] = None,
-        type_warnings: Optional[List[str]] = None,
-        constraint_warnings: Optional[List[str]] = None,
-        reasoning_observations: Optional[List[Optional[Dict[str, Any]]]] = None,
-        answer_format: str = "legacy",
-        transport_diagnostics: Optional[List[Optional[Dict[str, Any]]]] = None,
+        request: ExecuteRequest,
+        result: ExecuteResult,
+        *,
+        parsed_result: Any = _USE_RESULT,
     ) -> None:
+        """Record a result, optionally retaining a candidate withheld by validation."""
         # Protect record numbering and writing through this tracer instance.
         with self._lock:
             self._call_count += 1
 
             try:
+                parsed = result.result if parsed_result is _USE_RESULT else parsed_result
                 entry = {
                     "call_id": self._call_count,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "signature": signature,
-                    "docstring": docstring,
-                    "inputs": _safe_serialize(inputs),
-                    "raw_text": raw_text,
-                    "parsed_result": _safe_serialize(parsed_result),
-                    "parsed_type": type(parsed_result).__name__,
-                    "model": model,
-                    "strategy": strategy,
-                    "substrategy": substrategy,
-                    "revised": revised,
-                    "pre_revision_value": _safe_serialize(pre_revision_value),
-                    "provider_finish_reason": provider_finish_reason,
-                    # Strategy-recorded prompts supplied by the runtime.
-                    "prompts": prompts or [],
-                    "reasoning_requests": _safe_serialize(reasoning_requests),
-                    "reasoning_observations": _safe_serialize(reasoning_observations),
-                    "answer_format": answer_format,
-                    "transport_diagnostics": _safe_serialize(transport_diagnostics),
-                    "latency_ms": round(latency_ms, 1),
-                    # Legacy strategy-reported token count.
-                    "tokens_used": tokens_used,
-                    # Strategy-reported output-token ceiling, not tokens consumed.
-                    "token_budget_used": token_budget_used,
-                    "cached": cached,
-                    "retries": retries,
-                    "input_warnings": input_warnings or [],
-                    "type_warnings": type_warnings or [],
-                    "constraint_warnings": constraint_warnings or [],
+                    "signature": request.signature,
+                    "docstring": request.docstring,
+                    "inputs": request.inputs,
+                    # Only declared result fields; no copying of arbitrary caller objects.
+                    **{field.name: getattr(result, field.name) for field in fields(ExecuteResult)},
+                    "parsed_result": parsed,
+                    "parsed_type": type(parsed).__name__,
                 }
+                entry["latency_ms"] = None if result.latency_ms is None else round(result.latency_ms, 1)
 
-                line = json.dumps(entry, ensure_ascii=False, default=str)
+                line = json.dumps(_safe_serialize(entry), ensure_ascii=False, default=str)
 
-                with open(self.path, "a", encoding="utf-8") as f:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path, "a", encoding="utf-8", errors="backslashreplace") as f:
                     f.write(line + "\n")
             except Exception:
                 # Optional diagnostics must not prevent returning a prediction.

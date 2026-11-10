@@ -1,10 +1,36 @@
-"""Pure grading and answer normalization shared by benchmark runners."""
+"""Pure grading under the reviewed release's frozen scoring profiles."""
 
 from __future__ import annotations
 
 import math
 import re
 from typing import Any, List, Optional
+
+from .values import canonical_json
+
+PROFILES = {"structured_abs_1e-6", "numeric_abs_1e-3", "unordered_set_abs_1e-6",
+            "mbpp_exact_or_float_v1", "mbpp_float_atol_1e-4_v1"}
+
+
+def compare(predicted: Any, expected: Any, profile: str) -> bool:
+    """Grade one prediction with its task's scoring profile."""
+    if profile == "numeric_abs_1e-3":
+        return answers_match(predicted, expected)
+    if profile in ("mbpp_exact_or_float_v1", "mbpp_float_atol_1e-4_v1"):
+        return _mbpp_float_compare(predicted, expected,
+                                   1e-4 if profile == "mbpp_float_atol_1e-4_v1" else 1e-6)
+    if profile == "structured_abs_1e-6":
+        return results_match(predicted, expected)
+    if profile == "unordered_set_abs_1e-6":
+        # Only tasks whose published scorer specifies set equivalence may
+        # request this. Order and duplicate count are intentionally ignored.
+        if type(predicted) not in (list, tuple, set, frozenset) or type(expected) not in (list, tuple, set, frozenset):
+            return False
+        try:
+            return results_match(set(predicted), set(expected))
+        except TypeError:
+            return False
+    raise ValueError(f"Unknown scoring profile: {profile}")
 
 
 def _unordered_results_match(predicted: List[Any], expected: List[Any], tolerance: float) -> bool:
@@ -100,16 +126,6 @@ def _finite_number(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
-def extract_gsm8k_answer(answer_str: str) -> float:
-    """Read the numeric target following one explicit #### final-answer marker."""
-    if not isinstance(answer_str, str) or answer_str.count("####") != 1:
-        raise ValueError("GSM8K ground truth requires one #### final-answer marker")
-    number = _finite_number(answer_str.split("####", 1)[1])
-    if number is None:
-        raise ValueError("GSM8K #### final answer must be wholly numeric and finite")
-    return number
-
-
 def answers_match(predicted: Any, expected: float, tolerance: float = 1e-3) -> bool:
     """Compare finite numeric answers using the existing absolute tolerance."""
     predicted_number = _finite_number(predicted)
@@ -117,3 +133,39 @@ def answers_match(predicted: Any, expected: float, tolerance: float = 1e-3) -> b
     if predicted_number is None or expected_number is None:
         return False
     return abs(predicted_number - expected_number) < tolerance
+
+
+def _mbpp_float_compare(predicted, expected, atol):
+    """Published MBPP float tolerances, with strict integer and boolean identity.
+
+    Approximation applies to float targets; integer labels remain exact.
+    Sequence ordering and duplicate counts are preserved. Set-equivalence tasks
+    use their separate profile. This does not execute the upstream scorer.
+    """
+    if type(expected) is float:
+        if type(predicted) not in (int, float):
+            return False
+        try:
+            return math.isfinite(predicted) and math.isfinite(expected) and math.isclose(
+                predicted, expected, rel_tol=1e-7, abs_tol=atol)
+        except OverflowError:
+            return False
+    if type(expected) in (list, tuple):
+        return (type(predicted) in (list, tuple) and len(predicted) == len(expected)
+                and all(_mbpp_float_compare(left, right, atol)
+                        for left, right in zip(predicted, expected)))
+    if type(expected) is dict:
+        if type(predicted) is not dict or len(predicted) != len(expected):
+            return False
+        # Keys retain their original typed identity; approximation belongs to
+        # numeric values, not dictionary key selection.
+        try:
+            keys = {canonical_json(key): key for key in predicted}
+        except (TypeError, ValueError):
+            return False
+        return all((encoded := canonical_json(key)) in keys
+                   and _mbpp_float_compare(predicted[keys[encoded]], value, atol)
+                   for key, value in expected.items())
+    if type(expected) is int:
+        return type(predicted) in (int, float) and predicted == expected
+    return results_match(predicted, expected)

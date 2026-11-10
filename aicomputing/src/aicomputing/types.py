@@ -1,14 +1,10 @@
-"""Function-signature parsing and public media type imports for AI Computing."""
+"""Function-signature parsing for AI Computing."""
 
 from __future__ import annotations
 
-import re
+import ast
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple, get_args, get_origin
-
-from .media import (
-    Audio, Image, MediaObject, Modality, Text, Video,
-)
 
 
 # Signature parsing.
@@ -19,61 +15,7 @@ _TYPE_ALIASES: Dict[str, Any] = {
     "list": list, "dict": dict, "tuple": tuple, "set": set,
     "List": list, "Dict": dict, "Tuple": tuple, "Set": set,
     "Any": Any,
-    "Image": Image, "Audio": Audio, "Video": Video, "Text": Text,
-    "MediaObject": MediaObject,
 }
-
-# Nested parentheses are unsupported outside quoted defaults.
-_SIG_RE = re.compile(
-    r"^\s*(?P<name>\w+)\s*\("
-    r"(?P<params>[^)]*)"
-    r"\)\s*(?:->\s*(?P<ret>.+))?\s*$"
-)
-
-
-def _parse_param(part: str) -> Optional[ParsedParam]:
-    """Parse a parameter fragment, preserving its default as source text."""
-    part = part.strip()
-    if not part:
-        return None
-
-    # Find a top-level '=' using bracket depth; quoted text is not interpreted.
-    default: Optional[str] = None
-    depth = 0
-    for i, ch in enumerate(part):
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == "=" and depth == 0:
-            default = part[i + 1:].strip() or None
-            part = part[:i].strip()
-            break
-
-    # Split the parameter name from its annotation.
-    if ":" in part:
-        pname, ptype_str = part.split(":", 1)
-        pname = pname.strip()
-        ptype_str = ptype_str.strip() or None
-    else:
-        pname, ptype_str = part.strip(), None
-
-    if not pname or not re.match(r"^\*{0,2}\w+$", pname):
-        return None
-
-    if pname.startswith("*"):
-        raise UnsupportedAnnotationError(
-            f"Variadic parameters are unsupported: {pname!r}"
-        )
-
-    resolved = resolve_type_str(ptype_str) if ptype_str else Any
-    return ParsedParam(
-        name=pname,
-        annotation=ptype_str,
-        resolved_type=resolved,
-        default=default,
-    )
-
 
 @dataclass
 class ParsedParam:
@@ -98,7 +40,7 @@ class ParsedSignature:
 
 
 class UnsupportedAnnotationError(ValueError):
-    """A specification has unsupported annotations or malformed quoted text."""
+    """A declaration uses an unsupported annotation or parameter feature."""
 
 
 def validate_type_annotation(annotation: Any) -> None:
@@ -152,123 +94,101 @@ def validate_type_annotation(annotation: Any) -> None:
         validate_type_annotation(arg)
 
 
+def _resolve_annotation(node: ast.expr) -> Any:
+    """Resolve only known names and container subscriptions, without evaluation."""
+    if isinstance(node, ast.Name) and node.id in _TYPE_ALIASES:
+        return _TYPE_ALIASES[node.id]
+    if isinstance(node, ast.Constant) and node.value is None:
+        return type(None)
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+        origin = _TYPE_ALIASES.get(node.value.id)
+        if origin in (list, dict, tuple, set):
+            arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if not arguments:
+                raise UnsupportedAnnotationError("Empty generic annotations are unsupported")
+            resolved = []
+            for index, argument in enumerate(arguments):
+                # Only tuple[T, ...] permits an ellipsis as a type argument.
+                if (
+                    origin is tuple
+                    and len(arguments) == 2
+                    and index == 1
+                    and isinstance(argument, ast.Constant)
+                    and argument.value is Ellipsis
+                ):
+                    resolved.append(Ellipsis)
+                else:
+                    resolved.append(_resolve_annotation(argument))
+            annotation = origin[resolved[0] if len(resolved) == 1 else tuple(resolved)]
+            validate_type_annotation(annotation)
+            return annotation
+    raise UnsupportedAnnotationError(f"Unsupported type annotation: {ast.unparse(node)!r}")
+
+
 def resolve_type_str(s: str) -> Any:
-    """Resolve supported annotation text; raise for unknown or invalid forms."""
-    s = s.strip()
-    if s in _TYPE_ALIASES:
-        return _TYPE_ALIASES[s]
-
-    match = re.fullmatch(r"(\w+)\[(.+)\]", s)
-    if match:
-        origin_name, args_text = match.groups()
-        origin = _TYPE_ALIASES.get(origin_name)
-        if origin not in (list, dict, tuple, set):
-            raise UnsupportedAnnotationError(f"Unsupported type annotation: {s!r}")
-
-        parts = _split_type_args(args_text)
-        if not parts or any(not part for part in parts):
-            raise UnsupportedAnnotationError(f"Invalid type annotation: {s!r}")
-        resolved = tuple(
-            Ellipsis
-            if origin is tuple and len(parts) == 2 and index == 1 and part == "..."
-            else resolve_type_str(part)
-            for index, part in enumerate(parts)
-        )
-        try:
-            annotation = origin[resolved if len(resolved) > 1 else resolved[0]]
-        except TypeError as exc:
-            raise UnsupportedAnnotationError(
-                f"Invalid type annotation: {s!r}"
-            ) from exc
-        validate_type_annotation(annotation)
-        return annotation
-
-    raise UnsupportedAnnotationError(f"Unsupported type annotation: {s!r}")
-
-
-def _mask_string_contents(s: str) -> str:
-    """Mask quoted contents while preserving offsets and quote delimiters."""
-    masked = list(s)
-    quote: Optional[str] = None
-    escaped = False
-    index = 0
-    while index < len(s):
-        ch = s[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif s.startswith(quote, index):
-                index += len(quote)
-                quote = None
-                continue
-            if ch not in "\r\n":
-                masked[index] = " "
-        elif ch in ("'", '"'):
-            quote = ch * 3 if s.startswith(ch * 3, index) else ch
-            index += len(quote)
-            continue
-        index += 1
-    if quote is not None:
-        raise UnsupportedAnnotationError(f"Unterminated quoted text: {s!r}")
-    return "".join(masked)
-
-
-def _split_type_args(s: str) -> List[str]:
-    """Split at unquoted, top-level commas while preserving source text."""
-    parts: List[str] = []
-    depth = 0
-    current: List[str] = []
-
-    for ch, masked_ch in zip(s, _mask_string_contents(s)):
-        if masked_ch in ("(", "[", "{"):
-            depth += 1
-            current.append(ch)
-        elif masked_ch in (")", "]", "}"):
-            depth -= 1
-            current.append(ch)
-        elif masked_ch == "," and depth == 0:
-            parts.append("".join(current).strip())
-            current = []
-        else:
-            current.append(ch)
-
-    tail = "".join(current).strip()
-    if tail:
-        parts.append(tail)
-    return parts
+    """Parse a supported annotation expression without executing it."""
+    if not isinstance(s, str):
+        raise TypeError("Type annotation must be a string")
+    try:
+        expression = ast.parse(s.strip(), mode="eval")
+    except SyntaxError as exc:
+        raise UnsupportedAnnotationError(f"Invalid type annotation: {s!r}") from exc
+    return _resolve_annotation(expression.body)
 
 
 def parse_signature(sig: str) -> ParsedSignature:
-    """Parse supported signature text into names and type information."""
-    m = _SIG_RE.match(_mask_string_contents(sig))
-    if not m:
-        raise ValueError(f"Cannot parse signature: {sig!r}")
+    """Read one declaration, retaining annotations/defaults as source expressions.
 
-    name = sig[m.start("name"):m.end("name")]
-    raw_params = sig[m.start("params"):m.end("params")].strip()
-    return_annotation = (
-        sig[m.start("ret"):m.end("ret")].strip() if m.group("ret") else None
-    )
+    Compilation checks declaration rules such as duplicate names. The resulting
+    code object is discarded; annotations and default expressions never run.
+    """
+    if not isinstance(sig, str):
+        raise TypeError("Function signature must be a string")
+    source = "def " + sig.strip() + ":\n    pass\n"
+    try:
+        tree = ast.parse(source, filename="<signature>")
+        if (
+            len(tree.body) != 1
+            or not isinstance(tree.body[0], ast.FunctionDef)
+            or len(tree.body[0].body) != 1
+            or not isinstance(tree.body[0].body[0], ast.Pass)
+        ):
+            raise ValueError("Expected a function signature without a body or additional statements")
+        declaration = tree.body[0]
+        compile(tree, "<signature>", "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid function signature {sig!r}: {exc.msg}") from None
 
-    params: List[ParsedParam] = []
-    if raw_params:
-        # Preserve nested generic arguments while splitting parameters.
-        for part in _split_type_args(raw_params):
-            parsed = _parse_param(part)
-            if parsed is not None:
-                params.append(parsed)
+    if getattr(declaration, "type_params", []):
+        raise UnsupportedAnnotationError("Generic function type parameters are unsupported")
+    arguments = declaration.args
+    if arguments.vararg is not None or arguments.kwarg is not None:
+        raise UnsupportedAnnotationError("Variadic parameters are unsupported")
 
-    ret_type = (
-        resolve_type_str(return_annotation)
-        if return_annotation is not None
-        else Any
-    )
+    positional = arguments.posonlyargs + arguments.args
+    parameters = positional + arguments.kwonlyargs
+    required_positional_count = len(positional) - len(arguments.defaults)
+    positional_defaults = [None] * required_positional_count + arguments.defaults
+    defaults = positional_defaults + arguments.kw_defaults
+    params = []
+    for parameter, default in zip(parameters, defaults):
+        annotation = (
+            ast.get_source_segment(source, parameter.annotation)
+            if parameter.annotation is not None else None
+        )
+        params.append(ParsedParam(
+            name=parameter.arg,
+            annotation=annotation,
+            resolved_type=_resolve_annotation(parameter.annotation) if annotation is not None else Any,
+            default=ast.get_source_segment(source, default) if default is not None else None,
+        ))
 
     return ParsedSignature(
-        name=name,
+        name=declaration.name,
         params=params,
-        return_annotation=return_annotation,
-        return_type=ret_type,
+        return_annotation=(
+            ast.get_source_segment(source, declaration.returns)
+            if declaration.returns is not None else None
+        ),
+        return_type=_resolve_annotation(declaration.returns) if declaration.returns is not None else Any,
     )

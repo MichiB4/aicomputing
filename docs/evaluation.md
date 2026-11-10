@@ -1,163 +1,97 @@
-# Experimental evaluation
+# Benchmark and scoring reference
 
-The research tooling is separate from the installable oracle package. Package
-users need no benchmark datasets or reference answers; see the
-[package guide](../aicomputing/README.md). For running a study, follow the
-[reproducible workflow](../evaluation/README.md).
+The evaluation tooling measures model predictions for concrete function inputs.
+Run it with the [single-command workflow](../evaluation/README.md). Ordinary
+oracle-package use does not require datasets or reference answers.
 
-## Study design
+## Benchmarks and approaches
 
-| Benchmark | Selected tasks | Strategies |
-|---|---:|---|
-| HumanEval+ | 100 | Direct, CoT, pseudocode, contract |
-| MBPP+ | 100 | Direct, CoT, pseudocode, contract |
-| GSM8K | 100 | Direct, CoT, pseudocode, contract |
+| Benchmark | Default task count | Approaches |
+| --- | ---: | --- |
+| HumanEval+ | 100 | Direct, CoT, Pseudocode, Contract, code generation/execution |
+| MBPP+ | 100 | Direct, CoT, Pseudocode, Contract, code generation/execution |
+| GSM8K | 100 | Direct, CoT, Pseudocode, Contract, code generation/execution |
 
-Each coding function contributes one concrete input. All strategies and models
-receive the same selected tasks, specifications and inputs. This measures
-return-value prediction from specifications and inputs, rather than the standard
-code-generation pass@1 used by HumanEval and MBPP.
+All approaches, including code generation/execution, run through the package's
+`VirtualRuntime` strategies. The evaluator handles selection, scoring, and
+recording; the package owns prompting and the standard Python worker.
 
-The full study has 1,200 evaluations per model and 1,500 nominal model calls:
-contract uses a prediction call and a checking call. A five-task-per-benchmark
-smoke check has 60 evaluations and 75 nominal calls. Timeouts can add attempts.
-Confidence, self-consistency and hybrid remain available in the oracle package;
-the four study strategies are a separately selected experimental condition.
+Select any subset and sample size using `--benchmarks`, `--strategies`, and
+`--samples`. The sample size is per benchmark. Each task contributes one input,
+shared across the selected approaches. Matching seeds and reviewed data produce
+matching task/input selections across models. Smaller samples are prefixes of
+larger samples, taken from the same seeded shuffle.
 
-These are public development pools, not an unseen holdout. Possible training
-contamination and the limits of specification review must be reported with the
-results.
+The default configuration produces 1,500 evaluations and 1,800 nominal model
+calls. Contract uses a prediction call and a checking call. Timeout retries can
+add calls. Native reasoning effort is configured independently of the approach.
 
-## Reviewed data
+The four prompting approaches predict the function's return value from its
+specification and input. The code approach generates an implementation, executes
+it in a standard Python worker, and grades its returned value against the same target.
+GSM8K code generation writes arithmetic for the supplied word problem.
 
-| Source | Source tasks | Approved task pool | Quarantined |
-|---|---:|---:|---:|
-| HumanEval+ | 164 | 153 | 11 |
-| MBPP+ | 378 | 343 | 35 |
-| GSM8K test | 1,319 | 1,181 | 138 |
+## Shared reviewed data
 
-Review retains the original public descriptions and examples, clearly labels
-examples, and selects a different actual input. Input exclusions cover repeated
-examples, incompatible interfaces, unspecified domains and target disagreements.
-Independent rules derived from public specifications and question arithmetic
-were used for review, without evaluated model responses. This reduces preventable
-data errors; it does not prove every natural-language specification unambiguous.
+The reviewed dataset is included at `data/dataset-release.json`, with its release
+identity, checksum and upstream notices in [the data guide](../data/README.md).
+Another reviewed
+release can be supplied with `--dataset-release`. Selection uses approved tasks
+and observations, verifies their content, and records their fingerprints and
+scoring profiles in the result JSON. Resume uses the saved tasks rather than
+reselecting them or requiring the source dataset file.
 
-A release records every source task as approved or quarantined, its review
-reason/evidence, typed inputs/targets, public-example exclusions and grading
-profile. `prepared_data.py` validates the release before selection. Missing or
-changed releases, unknown scoring profiles, conflicting duplicate targets and
-insufficient approved pools stop preparation. Inference resolves only the frozen
-release; it does not download datasets or execute reference implementations.
+Public specifications and examples are retained. Actual inputs exclude displayed
+public-example inputs. Expected answers are grading-only data and are not passed
+to the model. The evaluated reference implementation is not supplied to the
+model or used to repair its output.
 
-The current local release is
-`manifests/prepared/mbpp-published-20261030-v2/dataset-release.json`.
-Its SHA-256 is
-`b961d334453779e42bd4e32df90b71fb2f177ff0be008a0dcc742ba273edff15`.
-Prepared data is distributed separately from a source-only checkout.
+For MBPP+, reviewed targets originate from aligned published input/output lists.
+The bundled release contains the frozen targets and provenance. Evaluation does
+not run model-generated programs to establish expected answers.
 
-### HumanEval+
+These public benchmark cases are development data, not an unseen holdout.
+Published examples and possible training overlap limit conclusions about generalization.
 
-[Dataset](https://huggingface.co/datasets/evalplus/humanevalplus).
-The loader reads signature and docstring from the public prompt and extracts
-aligned literal `inputs`/`results` lists from the test script. It never executes
-that script. The reviewed release retains public examples and removes overlaps
-with the selected actual input. Public helper context is included only where
-explicitly reviewed; non-unique or insufficiently specified outputs are held.
+## Results and scoring
 
-### MBPP+
+The evaluator owns benchmark outcome classification and accuracy eligibility.
+Package results contain execution diagnostics; the evaluator adds `correct`,
+`scorable`, and benchmark-specific failure labels to its CSV/JSON records.
+The package's `execution_failure` is mapped from worker diagnostics to the
+existing `code_*` labels; worker harness failures remain infrastructure failures.
 
-[Dataset](https://huggingface.co/datasets/evalplus/mbppplus/viewer/default/test).
-The `test` column contains expanded module-level input/output lists. AST parsing
-extracts literals without executing imports, test programs or reference solutions.
-Python types and original pair indices (`published:N`) are preserved. The
-reference code supplies only the function interface, never the model's prompt.
+Evaluation requests the package's `validation_mode="none"` to preserve parsed
+outputs without type conversion. Successful parsing or execution is recorded as
+`validation_status="not_checked"`; benchmark structural validity and correctness
+are assessed separately. Ordinary package calls default to strict output checks.
 
-At cached revision `b2d74c91837c3f2a20c1299ae98133cbe7cfa077`, 375 tasks contain
-precomputed lists. There are 39,917 supported pairs across 372 tasks; 376 pairs
-contain unsupported complex/nonfinite values. `Mbpp/88`, `Mbpp/255` and `Mbpp/630`
-compute targets through helpers instead of listing them. Raw loading can use
-public base assertions for tasks without output lists. Malformed lists stop the
-task; unsupported pairs are omitted without coercion or invented labels.
+Predictions use the shared `framed_answer_v1` protocol. An isolated malformed
+result field such as `{"result": 7?}` is recovered as the unchanged text `"7?"`;
+it is not repaired to the number 7. Empty or ambiguous fields and missing answer
+boundaries are parse failures. Every raw response is retained.
 
-The current release maps 342 approved cases to exactly matching published values.
-`Mbpp/630` retains its independently reviewed predecessor observation with explicit
-provenance. All 343 frozen inputs, targets, pool labels and grading profiles are
-preserved. The prior 35 quarantines remain; extraction alone approves no new
-candidates. A reference-execution cache is neither loaded nor required.
+Each task's saved scoring profile defines its comparator. HumanEval+ uses
+structured comparison; MBPP+ uses its reviewed numeric, exact, or set-comparison
+rule; GSM8K uses numeric comparison. Type validation is separate from semantic
+correctness: a structurally valid answer may still be wrong.
 
-Base labels match typed argument content in public assertions, including wrapped
-calls. Unmatched calls use `unknown`, since public assertions do not form a
-complete base catalog across revisions. Reviewed releases inherit their verified
-base/plus labels by input identity and record that source.
+Wrong answers, malformed outputs, and generated-code syntax, policy, runtime, or
+execution-timeout failures count as incorrect. Exhausted API timeouts and provider
+failures are reported as infrastructure exclusions. Capability accuracy divides
+correct answers by scorable evaluations. The summary also reports correct answers
+divided by all completed evaluations, including infrastructure failures.
 
-To trace a reviewed release to a new local source snapshot, offline:
+No parsing, validation, or code-repair call is made automatically. The generated
+code prompt requests a general syntax and semantic review before submission.
+An explicit token cap is never expanded automatically after truncation.
 
-```bash
-python -B scripts/prepare_mbpp_published.py --source-arrow PATH_TO_MBPP_ARROW --source-revision SOURCE_REVISION --previous-release PATH_TO_REVIEWED_RELEASE.json --release-id NEW_RELEASE_ID --out-dir manifests/prepared/NEW_RELEASE_DIRECTORY
-```
+Results are saved as one detailed CSV and one JSON. They retain prompts, raw
+responses, generated code, execution evidence, settings, usage, and previous
+attempts. Explicit retries replace the current row with the latest outcome while
+preserving earlier history and charges. Completed evaluations are skipped when
+resuming an interrupted run.
 
-The new directory contains the release, exact source Arrow bytes, predecessor
-release, comparison report and pair-exclusion ledger. SHA-256 identifies the
-actual bytes; the revision argument records supplied source metadata. Migration
-checks public text, examples, interface and recognized scorer ASTs. Targets must
-match exactly by typed input identity. Missing/conflicting observations are
-quarantined without relabeling or resampling. Existing directories are rejected.
-
-### GSM8K
-
-[Dataset](https://huggingface.co/datasets/openai/gsm8k).
-Each task provides a question and a worked solution ending in a `####` numeric
-answer. Only the question is shown to the model. Preparation extracts the final
-number and uses independent question arithmetic for review.
-
-## Selection, output and scoring
-
-The selection seed defaults to 42. Task IDs are sorted and sampled deterministically;
-one reviewed input per coding function prevents functions with more generated
-tests from receiving more statistical weight. The smoke check uses the prefix of
-the same 100-task selection. Manifests pin selected input and content fingerprints.
-
-The maintained runner uses `framed_text_v1`. Every strategy clearly separates
-public examples, the actual task and the final-answer block. The parser reads
-only that block. It does not use reference types to coerce predictions or repair
-incomplete answers. An isolated malformed result can remain text with a parse
-warning; a missing or ambiguous answer remains a parsing failure.
-
-Grading uses the release's fixed profile: structured comparison for HumanEval+,
-reviewed equality/tolerance or set equivalence for MBPP+, and numeric absolute
-tolerance 0.001 for GSM8K. Reference values remain evaluation-only data.
-
-Structural validity checks a public return annotation without converting the
-prediction. Unannotated/Any returns are `not_assessed`; a single gold answer does
-not establish a universal required type. Constraint validity checks only explicit
-constraints. Semantic correctness is the frozen grader's comparison.
-
-Incorrect answers distinguish parsing failure, declared structural/constraint
-failure, reference-type mismatch and semantic wrong answer. Provider errors,
-timeouts and harness errors are infrastructure exclusions outside capability
-accuracy. Contract status records whether a check changed the prediction, not
-whether its output is correct. Unknown token usage stays unknown.
-
-## Future model runs
-
-The [maintained workflow](../evaluation/README.md) prepares, preflights, executes
-and audits GPT-6 Luna studies with source/environment snapshots, a frozen budget,
-60-second HTTP phase timeouts and up to two timeout retries. Parsing/validation
-failures do not trigger retries. No application output-token cap or tools are
-supplied. The phase timeout is not a total wall-clock deadline.
-
-Shared manifest-driven tools remain available for the planned local models:
-
-```bash
-python scripts/make_manifest.py --experiment-id local-study --dataset-release PATH_TO_RELEASE.json --model-configs PATH_TO_MODELS.json --out manifests/local-study.json
-python scripts/run_experiment.py --manifest manifests/local-study.json --dry-run
-python scripts/run_experiment.py --manifest manifests/local-study.json --out-dir runs/local-study
-python scripts/aggregate_results.py --raw runs/local-study --out runs/local-study-summary.csv
-```
-
-Model configuration contains connection, native reasoning and generation settings,
-never credentials. The generic launcher does not provide the Luna runner's audited
-budget and timeout-retry machinery. Use the audited workflow for the paid Luna run.
-Changes to software or experimental settings require a fresh prepared manifest.
-Saved evaluation archives are outside the active workflow and remain local.
+Costs distinguish reported usage from conservative reservations for calls with
+unknown usage. Model profiles record price assumptions; custom models supply
+their rates explicitly.

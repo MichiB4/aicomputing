@@ -5,13 +5,21 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from ..model_config import DEFAULT_MAX_NEW_TOKENS
 from ..request import validate_generation_limits
-from .reasoning import ReasoningCapabilities
+from ..validation import validate_nonblank_text
 
 logger = logging.getLogger("aicomputing")
+
+
+def _close_after_error(close: Callable[[], None]) -> None:
+    """Attempt cleanup without replacing an active error with a cleanup error."""
+    try:
+        close()
+    except Exception as exc:
+        logger.warning("Backend cleanup also failed with %s; preserving the original error.",
+                       type(exc).__name__)
 
 
 class BackendCommunicationError(RuntimeError):
@@ -35,12 +43,13 @@ class ToolUseDetected(RuntimeError):
 
 @dataclass
 class GenerateResponse:
-    """Raw response from a backend."""
+    """Original assistant text, optional parsing view, and provider evidence."""
     text: str
     model: str
 
-    # Legacy alias for output_tokens.
-    tokens_used: Optional[int] = None
+    # Cleanup for parsing must not replace the original assistant text.
+    # None uses text unchanged; an empty string is an intentionally empty view.
+    text_for_parsing: Optional[str] = None
 
     # Provider-reported usage; None means unreported, never estimated.
     input_tokens: Optional[int] = None
@@ -62,6 +71,10 @@ class GenerateResponse:
     # Optional per-SDK-call transport evidence, never a response body or URL.
     transport_diagnostics: Optional[Dict[str, Any]] = None
 
+    @property
+    def parsing_text(self) -> str:
+        return self.text if self.text_for_parsing is None else self.text_for_parsing
+
 
 # Normalize aliases once; strategies recognize truncation as exactly "length".
 _LENGTH_ALIASES = {alias.replace("_", "") for alias in (
@@ -69,7 +82,7 @@ _LENGTH_ALIASES = {alias.replace("_", "") for alias in (
     "model_length", "token_limit", "truncated",
 )}
 
-# Non-truncation reasons, including filters and tool calls, must not expand budgets.
+# Non-truncation reasons, including filters and tool calls, normalize to stop.
 _STOP_ALIASES = {alias.replace("_", "") for alias in (
     "stop", "end_turn", "eos", "eos_token", "stop_sequence",
     "complete", "completed", "finished", "content_filter",
@@ -101,11 +114,15 @@ def _iter_keys(obj: Any):
             yield from _iter_keys(value)
 
 
-def detect_tool_use(choice: Any, raw_dump: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def detect_tool_use(
+    choice: Any, raw_dump: Optional[Dict[str, Any]] = None,
+    *, finish_reason: Optional[str] = None,
+) -> Optional[str]:
     """Describe tool-use indicators, or return None.
 
     Check message fields, finish reasons, and populated raw-response keys.
     Prose values are ignored to avoid rejecting answers that discuss tools.
+    Supply finish_reason when the provider uses a different termination field.
     """
     message = getattr(choice, "message", None)
     if message is not None:
@@ -114,7 +131,9 @@ def detect_tool_use(choice: Any, raw_dump: Optional[Dict[str, Any]] = None) -> O
         if getattr(message, "function_call", None):
             return "message.function_call is populated"
 
-    finish = str(getattr(choice, "finish_reason", "") or "").strip().lower()
+    if finish_reason is None:
+        finish_reason = getattr(choice, "finish_reason", None)
+    finish = str(finish_reason or "").strip().lower()
     if finish.replace("-", "_") in _TOOL_USE_FINISH_REASONS:
         return f"finish_reason={finish!r}"
 
@@ -144,7 +163,7 @@ def _key_is_populated(obj: Any, target: str) -> bool:
 def normalize_finish_reason(value: Optional[str], model: str = "") -> str:
     """Map finish reasons to "stop" or "length", ignoring case and separators.
 
-    Unknowns warn and default to "stop" to avoid unwarranted budget retries.
+    Unknowns warn and default to "stop"; the original value remains recorded.
     """
     if value is None:
         return "stop"
@@ -160,8 +179,7 @@ def normalize_finish_reason(value: Optional[str], model: str = "") -> str:
 
     logger.warning(
         "Unrecognised finish_reason %r from model %r — treating as 'stop'. "
-        "Truncation will not be retried for this response; add the value to "
-        "_LENGTH_ALIASES or _STOP_ALIASES in backends/base.py if it recurs.",
+        "Add the value to _LENGTH_ALIASES or _STOP_ALIASES in backends/base.py if it recurs.",
         value, model or "<unknown>",
     )
     return "stop"
@@ -182,8 +200,11 @@ class Backend(ABC):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """Release owned resources without suppressing body exceptions."""
-        self.close()
+        """Release resources, preserving an active error if cleanup also fails."""
+        if exc_type is None:
+            self.close()
+        else:
+            _close_after_error(self.close)
 
     @property
     @abstractmethod
@@ -194,59 +215,6 @@ class Backend(ABC):
     @abstractmethod
     def default_model(self) -> str:
         """Default model name when none is specified."""
-
-    # Native names and transport types; no model-name classifications.
-    reasoning_parameter: Optional[str] = None
-    _reasoning_value_types: tuple[type, ...] = ()
-
-    def _reasoning_endpoint(self) -> Optional[str]:
-        return None
-
-    def reasoning_capabilities(
-        self, model: Optional[str] = None, *, discover: bool = False,
-    ) -> ReasoningCapabilities:
-        """Return controls without inference; subclasses may discover metadata."""
-        if type(discover) is not bool:
-            raise TypeError("discover must be a bool")
-        selected = self.default_model if model is None else model
-        return ReasoningCapabilities(
-            backend=self.name, model=selected, parameter=self.reasoning_parameter,
-            endpoint=self._reasoning_endpoint(),
-            support="unknown" if self.reasoning_parameter else "unsupported",
-            source="unavailable",
-        )
-
-    def reasoning_options(
-        self, value: bool | str | None, *, model: Optional[str] = None,
-        capabilities: Optional[ReasoningCapabilities] = None,
-        discover: bool = False, allow_unknown: bool = False,
-    ) -> Dict[str, Any]:
-        """Build validated constructor options; do not change this backend."""
-        if type(discover) is not bool or type(allow_unknown) is not bool:
-            raise TypeError("discover and allow_unknown must be bools")
-        if value is None:
-            return {}
-        if type(value) not in self._reasoning_value_types:
-            raise TypeError("Value has the wrong type for this adapter's native control")
-        ReasoningCapabilities._check_value(value)
-        local = self.reasoning_capabilities(model, discover=False)
-        if local.support == "unsupported":
-            local.validate(value)
-        if capabilities is not None and discover:
-            raise ValueError("Pass capabilities or request discovery, not both")
-        if capabilities is None:
-            capabilities = self.reasoning_capabilities(model, discover=True) if discover else local
-        if not isinstance(capabilities, ReasoningCapabilities):
-            raise TypeError("capabilities must be ReasoningCapabilities")
-        if (
-            capabilities.backend, capabilities.model,
-            capabilities.parameter, capabilities.endpoint,
-        ) != (local.backend, local.model, local.parameter, local.endpoint):
-            raise ValueError("Capabilities belong to a different adapter, model or endpoint")
-        if any(type(item) not in self._reasoning_value_types for item in capabilities.values):
-            raise TypeError("Advertised values cannot be sent by this adapter")
-        capabilities.validate(value, allow_unknown=allow_unknown)
-        return {self.reasoning_parameter: value}
 
     def cache_state(self) -> Optional[Dict[str, Any]]:
         """Return non-secret generation/acceptance settings, or None to bypass caching.
@@ -263,7 +231,7 @@ class Backend(ABC):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = None,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
@@ -287,26 +255,41 @@ class Backend(ABC):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = None,
         **kwargs,
     ) -> GenerateResponse:
-        """Generate from messages; the default concatenates their content."""
-        validate_generation_limits(max_new_tokens, 0)
+        """Forward one user message to generate() without changing its content.
+
+        Override this method to support conversations, other roles, or additional
+        message fields; the plain-prompt adapter cannot preserve those semantics.
+        """
+        validate_nonblank_text(model, "model", optional=True)
+        validate_generation_limits(max_new_tokens, 0, temperature=temperature, top_p=top_p)
         if "think" in kwargs:
             raise TypeError(
                 "The per-call 'think' argument is no longer supported; "
                 "configure native reasoning on the backend."
             )
-        prompt = "\n\n".join(msg.get("content", "") for msg in messages)
+        if not isinstance(messages, list) or any(not isinstance(msg, dict) for msg in messages):
+            raise TypeError("messages must be a list of message dictionaries")
+        if len(messages) != 1 or messages[0].get("role") != "user":
+            raise ValueError(
+                "The default chat adapter accepts only one user message; "
+                "implement generate_chat() to support other conversations."
+            )
+        message = messages[0]
+        if set(message) - {"role", "content"}:
+            raise ValueError(
+                "The default chat adapter accepts only role and content fields; "
+                "implement generate_chat() to support other message fields."
+            )
+        if not isinstance(message.get("content"), str):
+            raise TypeError("User message content must be a string")
         return self.generate(
-            prompt,
+            message["content"],
             model=model,
             temperature=temperature,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             **kwargs,
         )
-
-    def is_available(self) -> bool:
-        """Check if the backend is reachable / importable."""
-        return True

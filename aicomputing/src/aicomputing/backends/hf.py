@@ -2,10 +2,13 @@
 
 enable_thinking is passed to the chat template; support depends on that template.
 Recorded settings do not establish the model's reasoning mode.
+Chat templates receive the original message roles. Without a template, only
+a single user message is supported.
 
 None permits generation until EOS or the remaining model context. Unknown
 context capacity requires an explicit token allowance. Leading <think> blocks
 are stripped, including openers supplied by the template; raw output is retained.
+Explicit allowances exceeding the known remaining context fail before inference.
 
 Install: pip install aicomputing[hf]
 """
@@ -14,10 +17,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from ..model_config import DEFAULT_MAX_NEW_TOKENS
 from ..request import validate_generation_limits
+from ..validation import validate_nonblank_text
 from ._text_utils import strip_thinking
-from .base import Backend, GenerateResponse, ReasoningCapabilities
+from .base import Backend, GenerateResponse
 
 
 def _declared_context_length(model: Any, tokenizer: Any) -> Optional[int]:
@@ -53,6 +56,8 @@ class HFBackend(Backend):
         *,
         enable_thinking: Optional[bool] = None,
     ) -> None:
+        validate_nonblank_text(model, "model")
+        validate_nonblank_text(device, "device", optional=True)
         if enable_thinking is not None and not isinstance(enable_thinking, bool):
             raise TypeError("enable_thinking must be a bool or None")
 
@@ -74,21 +79,6 @@ class HFBackend(Backend):
         self._tokenizer = None
         self._device = self._configured_device
 
-    reasoning_parameter = "enable_thinking"
-    _reasoning_value_types = (bool,)
-
-    def reasoning_capabilities(
-        self, model: Optional[str] = None, *, discover: bool = False,
-    ) -> ReasoningCapabilities:
-        local = super().reasoning_capabilities(model, discover=discover)
-        if local.model == self._model_name and self._tokenizer is not None:
-            if getattr(self._tokenizer, "chat_template", None) is None:
-                return ReasoningCapabilities(
-                    backend=local.backend, model=local.model, parameter=local.parameter,
-                    support="unsupported", source="loaded_tokenizer_without_chat_template",
-                )
-        return local
-
     def _load(self):
         if self._model is not None:
             return
@@ -102,7 +92,9 @@ class HFBackend(Backend):
         model = AutoModelForCausalLM.from_pretrained(
             self._model_name, torch_dtype="auto",
         )
-        device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
 
         # Publish initialized state only after device placement succeeds.
@@ -136,14 +128,33 @@ class HFBackend(Backend):
         model: Optional[str] = None,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        max_new_tokens: Optional[int] = DEFAULT_MAX_NEW_TOKENS,
+        max_new_tokens: Optional[int] = None,
         stop: Optional[List[str]] = None,
         **kwargs,
     ) -> GenerateResponse:
+        return self.generate_chat(
+            [{"role": "user", "content": prompt}], model=model,
+            temperature=temperature, top_p=top_p,
+            max_new_tokens=max_new_tokens, stop=stop, **kwargs,
+        )
+
+    def generate_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_new_tokens: Optional[int] = None,
+        stop: Optional[List[str]] = None,
+        **kwargs,
+    ) -> GenerateResponse:
+        """Render message roles through the tokenizer's own chat template."""
         if kwargs:
             names = ", ".join(sorted(kwargs))
             raise TypeError(f"Unsupported generation options: {names}")
-        validate_generation_limits(max_new_tokens, 0)
+        validate_nonblank_text(model, "model", optional=True)
+        validate_generation_limits(max_new_tokens, 0, temperature=temperature, top_p=top_p)
         if model is not None and model != self._model_name:
             raise ValueError(
                 f"HFBackend cannot use model {model!r}; it is configured for "
@@ -151,11 +162,12 @@ class HFBackend(Backend):
             )
         if stop:
             raise ValueError("HFBackend does not support nonempty stop sequences")
+        if not messages:
+            raise ValueError("messages must contain at least one message")
 
         import torch
         self._load()
 
-        messages = [{"role": "user", "content": prompt}]
         template_kwargs: Dict[str, Any] = {}
         if self._enable_thinking is not None:
             template_kwargs["enable_thinking"] = self._enable_thinking
@@ -166,7 +178,12 @@ class HFBackend(Backend):
                 raise ValueError(
                     "enable_thinking requires a tokenizer chat template"
                 )
-            text = prompt
+            if len(messages) != 1 or messages[0].get("role") != "user":
+                raise ValueError(
+                    "HFBackend without a chat template accepts only one user "
+                    "message; use a model with a chat template for conversations."
+                )
+            text = messages[0]["content"]
         else:
             text = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True,
@@ -193,6 +210,12 @@ class HFBackend(Backend):
                     f"HFBackend input uses {input_length} tokens and leaves no "
                     f"generation space in the {context_length}-token context."
                 )
+        elif context_length is not None and input_length + max_new_tokens > context_length:
+            raise ValueError(
+                f"HFBackend input uses {input_length} tokens and requests "
+                f"{max_new_tokens} output tokens, exceeding the {context_length}-token "
+                f"context ({max(0, context_length - input_length)} output tokens available)."
+            )
 
         eos_token_id = self._model.generation_config.eos_token_id
         if eos_token_id is None:
@@ -216,11 +239,11 @@ class HFBackend(Backend):
 
         new_tokens = gen_ids[0][input_length:]
         generated_text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
-        raw_text = generated_text.strip()
+        parsing_text = generated_text
         # A template may supply the opener before newly generated tokens begin.
         if has_chat_template and text.rstrip().endswith("<think>"):
-            raw_text = "<think>" + raw_text
-        raw_text = strip_thinking(raw_text)
+            parsing_text = "<think>" + parsing_text
+        parsing_text = strip_thinking(parsing_text)
 
         # Reaching the allowance without EOS signals truncation.
         n_new = len(new_tokens)
@@ -234,9 +257,9 @@ class HFBackend(Backend):
         )
 
         return GenerateResponse(
-            text=raw_text,
+            text=generated_text,
             model=self._model_name,
-            tokens_used=n_new,
+            text_for_parsing=parsing_text,
             input_tokens=input_length,
             output_tokens=n_new,
             requested_reasoning=dict(template_kwargs),
@@ -251,12 +274,3 @@ class HFBackend(Backend):
                 },
             },
         )
-
-    def is_available(self) -> bool:
-        """Check dependency importability without loading a model."""
-        try:
-            import transformers  # noqa: F401
-            import torch  # noqa: F401
-            return True
-        except ImportError:
-            return False

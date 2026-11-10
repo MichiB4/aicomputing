@@ -1,0 +1,12 @@
+{
+  "model": "gpt-6-luna",
+  "benchmarks": ["humaneval_plus", "mbpp_plus", "gsm8k"],
+  "strategies": ["direct", "cot", "pseudocode", "contract", "code_execute"],
+  "samples": 10,
+  "seed": 42,
+  "reasoning": "none",
+  "timeout": 180,
+  "retries": 1,
+  "budget": 2,
+  "output": "../results/example"
+}

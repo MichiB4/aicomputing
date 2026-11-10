@@ -1,33 +1,25 @@
 """Strategy interface, shared prediction calls, and response accounting.
 
-Strategies predict values without executing generated implementations. Native
-reasoning follows backend configuration.
+Prediction strategies return model-produced values; code_execute runs a
+generated implementation. Native reasoning follows backend configuration.
 
-None leaves output uncapped by the application. Truncation retries double an
-explicit allowance up to five times; provider limits still apply. Runtime
-validation retries are separate.
+None leaves output uncapped by the application. Explicit token limits stay
+fixed on every call. Validation retries are controlled by the runtime.
 """
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
 from ..backends.base import Backend, GenerateResponse
-from ..parsing import parse_result_detailed
+from ..parsing import ParseOutcome, coerce_type, parse_result
 from ..prompting import build_retry_prompt
 from ..request import ExecuteRequest
-from ..validation import ValidationMode
-
-logger = logging.getLogger("aicomputing")
-
-# Maximum additional calls after a response hits an explicit token budget.
-# Each retry doubles that budget; uncapped requests cannot be expanded.
-_MAX_RETRIES = 5
-
+from ..status import ParseStatus
+from ..validation import ValidationMode, validate_bool
 
 @dataclass
 class CallStats:
@@ -56,17 +48,11 @@ class CallStats:
         """Record usage, native requests, and response observations separately."""
         self.model_calls += 1
 
-        self.reasoning_requests.append(
-            deepcopy(getattr(response, "requested_reasoning", None))
-        )
-        self.reasoning_observations.append(
-            deepcopy(getattr(response, "observed_reasoning", None))
-        )
-        self.transport_diagnostics.append(deepcopy(getattr(response, "transport_diagnostics", None)))
-        raw_in = getattr(response, "input_tokens", None)
-        raw_out = getattr(response, "output_tokens", None)
-        if raw_out is None:
-            raw_out = getattr(response, "tokens_used", None)
+        self.reasoning_requests.append(deepcopy(response.requested_reasoning))
+        self.reasoning_observations.append(deepcopy(response.observed_reasoning))
+        self.transport_diagnostics.append(deepcopy(response.transport_diagnostics))
+        raw_in = response.input_tokens
+        raw_out = response.output_tokens
         if raw_in is None:
             self.input_complete = False
         if raw_out is None:
@@ -99,17 +85,14 @@ def _add_optional(a: Optional[int], b: Optional[int]) -> Optional[int]:
 class StrategyResult:
     """Result from a strategy execution (before runtime validation)."""
     value: Any
+    # Strategy response text; composite strategies may combine or annotate replies.
     raw_text: str
 
-    # Stage-order prompts; repeated samples/token retries are not separate entries.
+    # Stage-order prompts; repeated samples are not separate entries.
     prompts: List[str] = field(default_factory=list)
 
-    tokens_used: Optional[int] = None
-
-    # Final allowance, or None if uncapped/unrecorded. Multiple stages/samples
-    # report their maximum unless any was uncapped.
-    token_budget_used: Optional[int] = None
-    retries: int = 0
+    # Preserve the parsing view for retry feedback separately from raw evidence.
+    feedback_text: Optional[str] = None
 
     # Strategy selected by hybrid, when applicable.
     substrategy: Optional[str] = None
@@ -118,14 +101,20 @@ class StrategyResult:
     provider_finish_reason: Optional[str] = None
 
     # Accumulated model-call accounting, when supplied by the strategy.
+    # None makes invocation token totals unknown.
     call_stats: Optional[CallStats] = None
 
-    # Parsing status and diagnostic for the selected answer.
-    parse_status: Optional[str] = None
+    # Parsing status and diagnostic; explicit FAILED makes an attached value unavailable.
+    parse_status: Optional[ParseStatus] = None
     parse_error: Optional[str] = None
 
+    # Code extraction/execution diagnostics are separate from prediction parsing.
+    execution_error: Optional[str] = None
+
     # Contract checker verdict parsing, separate from answer parsing.
-    verdict_parse_status: Optional[str] = None
+    verdict_parse_status: Optional[ParseStatus] = None
+    verdict_parse_error: Optional[str] = None
+    verdict_finish_reason: Optional[str] = None
 
     # Whether revision changed the candidate; None if no check was reported.
     revised: Optional[bool] = None
@@ -133,14 +122,29 @@ class StrategyResult:
     # Original candidate before revision, when applicable.
     pre_revision_value: Any = None
 
+    # Generated-source strategies retain source and execution diagnostics.
+    generated_code: Optional[str] = None
+    execution_details: Optional[dict[str, Any]] = None
+
+    # A strategy may use its own response protocol instead of value framing.
+    answer_format: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.parse_status is not None:
+            self.parse_status = ParseStatus(self.parse_status)
+        if self.verdict_parse_status is not None:
+            self.verdict_parse_status = ParseStatus(self.verdict_parse_status)
+
 
 class Strategy(ABC):
     """Abstract base for execution strategies."""
 
+    supports_validation_retries = True
+
     @property
     @abstractmethod
     def name(self) -> str:
-        """Short identifier, e.g. 'direct', 'cot', 'code_gen'."""
+        """Short identifier, e.g. 'direct', 'cot', 'code_execute'."""
 
     def cache_state(self) -> dict[str, Any]:
         """Describe cache configuration; unsupported values bypass caching.
@@ -156,11 +160,58 @@ class Strategy(ABC):
         backend: Backend,
         feedback: Optional[dict] = None,
     ) -> StrategyResult:
-        """Predict with the supplied backend.
+        """Produce a value with the supplied backend.
 
         Retry feedback carries the previous response and validation message
         under "raw_output" and "error".
         """
+
+
+class PromptStrategy(Strategy):
+    """Predict with one prompt from ``prompt_builder``; subclasses set ``name``."""
+
+    prompt_builder: Callable[..., str]
+
+    def __init__(self, include_fewshot: bool = True) -> None:
+        validate_bool(include_fewshot, "include_fewshot")
+        self._include_fewshot = include_fewshot
+
+    def execute(
+        self,
+        request: ExecuteRequest,
+        backend: Backend,
+        feedback: Optional[dict] = None,
+    ) -> StrategyResult:
+        prompt = self.prompt_builder(
+            signature=request.signature,
+            docstring=request.docstring,
+            inputs=request.inputs,
+            include_fewshot=self._include_fewshot,
+        )
+        return _execute_prompt(request, backend, prompt, feedback)
+
+
+def _with_feedback(prompt: str, feedback: Optional[dict]) -> str:
+    """Append validation-retry feedback to a prompt, when supplied."""
+    if not feedback:
+        return prompt
+    return build_retry_prompt(
+        original_prompt=prompt,
+        raw_output=feedback.get("raw_output", ""),
+        error_message=feedback.get("error", ""),
+    )
+
+
+def _backend_call(
+    request: ExecuteRequest, backend: Backend, prompt: str,
+) -> Callable[[], GenerateResponse]:
+    """Bind the request's generation settings, including its fixed token limit."""
+    def call() -> GenerateResponse:
+        return backend.generate(
+            prompt, model=request.model, temperature=request.temperature,
+            top_p=request.top_p, max_new_tokens=request.max_new_tokens,
+        )
+    return call
 
 
 def _execute_prompt(
@@ -169,126 +220,34 @@ def _execute_prompt(
     prompt: str,
     feedback: Optional[dict] = None,
 ) -> StrategyResult:
-    """Generate and parse one prediction prompt, preserving retries and accounting."""
-    if feedback:
-        prompt = build_retry_prompt(
-            original_prompt=prompt,
-            raw_output=feedback.get("raw_output", ""),
-            error_message=feedback.get("error", ""),
-            answer_format=request.answer_format,
-        )
-
-    initial_budget = request.max_new_tokens
-
-    def call(max_new_tokens: Optional[int]):
-        return backend.generate(
-            prompt,
-            model=request.model,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            max_new_tokens=max_new_tokens,
-        )
-
-    psink: dict = {}
-    parse = make_parser(request.return_type, _is_strict(request), psink, answer_format=request.answer_format)
-
+    """Generate and parse one prediction prompt, preserving usage evidence."""
+    prompt = _with_feedback(prompt, feedback)
     stats = CallStats()
-    value, response, retries, final_budget = generate_with_retry(
-        call=call,
-        parse=parse,
-        initial_budget=initial_budget,
-        model_name=request.model or backend.default_model,
-        stats=stats,
+    outcome, response = _generate_once(
+        call=_backend_call(request, backend, prompt),
+        parse=make_parser(_output_type(request)), stats=stats,
     )
-
     return StrategyResult(
-        value=value,
-        raw_text=response.text,
-        prompts=[prompt],
-        tokens_used=response.tokens_used,
+        value=outcome.value, raw_text=response.text, prompts=[prompt],
+        feedback_text=response.parsing_text,
         provider_finish_reason=response.provider_finish_reason,
-        token_budget_used=final_budget,
-        retries=retries,
-        call_stats=stats,
-        parse_status=psink.get("parse_status"),
-        parse_error=psink.get("parse_error"),
+        call_stats=stats, parse_status=outcome.status, parse_error=outcome.error,
     )
 
 
-def generate_with_retry(
-    call: Callable[[Optional[int]], GenerateResponse],
-    parse: Callable[[str], Any],
-    initial_budget: Optional[int],
-    stats: Optional["CallStats"] = None,
-    model_name: str = "",
-) -> tuple[Any, GenerateResponse, int, Optional[int]]:
-    """Double explicit token allowances after finish_reason="length".
-
-    Uncapped calls cannot expand provider limits and are not retried here.
-    Record every returned response in stats. Never parse truncated text;
-    parse other responses once and propagate parser exceptions.
-
-    Return (value, final_response, additional_calls, final_requested_budget).
-    A parsed None may be valid; callers track recovery status separately.
-    """
-    if initial_budget is not None:
-        if type(initial_budget) is not int:
-            raise TypeError("initial_budget must be an integer or None")
-        if initial_budget <= 0:
-            raise ValueError("initial_budget must be positive")
-
-    budget = initial_budget
-    last_response = None
-    # Preserve the last requested limit separately from the next budget.
-    last_requested = budget
-
-    for attempt in range(_MAX_RETRIES + 1):
-        last_requested = budget
-        response = call(budget)
-        last_response = response
-        # Include usage from responses discarded because of truncation.
-        if stats is not None:
-            stats.record(response)
-
-        cutoff = response.finish_reason == "length"
-
-        if not cutoff:
-            value = parse(response.text)
-            if attempt > 0:
-                logger.info(
-                    "[retry] %s: response not marked as truncated "
-                    "at budget=%d (attempt %d)",
-                    model_name, budget, attempt + 1,
-                )
-            return value, response, attempt, budget
-
-        if budget is None:
-            logger.warning(
-                "[retry] %s: response reached a provider output or context "
-                "limit without an application token cap; no larger budget "
-                "can be requested",
-                model_name,
-            )
-            return None, response, 0, None
-
-        if attempt == _MAX_RETRIES:
-            break
-
-        new_budget = budget * 2
-        logger.warning(
-            "[retry] %s: hit token limit at budget=%d, "
-            "retrying with budget=%d (retry %d/%d)",
-            model_name, budget, new_budget, attempt + 1, _MAX_RETRIES,
-        )
-        budget = new_budget
-
-    logger.error(
-        "[retry] %s: all %d retries exhausted. "
-        "Last budget=%d, finish_reason=%s",
-        model_name, _MAX_RETRIES, last_requested,
-        getattr(last_response, "finish_reason", "?"),
-    )
-    return None, last_response, _MAX_RETRIES, last_requested
+def _generate_once(
+    call: Callable[[], GenerateResponse],
+    parse: Callable[[str], ParseOutcome],
+    stats: CallStats,
+) -> tuple[ParseOutcome, GenerateResponse]:
+    """Record one response and never decode a provider-reported truncated reply."""
+    response = call()
+    stats.record(response)
+    if response.finish_reason == "length":
+        outcome = ParseOutcome(None, ParseStatus.FAILED, "response truncated at output limit")
+    else:
+        outcome = parse(response.parsing_text)
+    return outcome, response
 
 
 def _same_value(a: Any, b: Any) -> bool:
@@ -306,20 +265,24 @@ def _same_value(a: Any, b: Any) -> bool:
         )
 
     if isinstance(a, dict):
-        return len(a) == len(b) and all(
-            any(
+        if len(a) != len(b):
+            return False
+        for left_key, left_value in a.items():
+            if not any(
                 _same_value(left_key, right_key)
                 and _same_value(left_value, right_value)
                 for right_key, right_value in b.items()
-            )
-            for left_key, left_value in a.items()
-        )
+            ):
+                return False
+        return True
 
     if isinstance(a, (set, frozenset)):
-        return len(a) == len(b) and all(
-            any(_same_value(left, right) for right in b)
-            for left in a
-        )
+        if len(a) != len(b):
+            return False
+        for left in a:
+            if not any(_same_value(left, right) for right in b):
+                return False
+        return True
 
     return bool(a == b)
 
@@ -327,7 +290,9 @@ def _same_value(a: Any, b: Any) -> bool:
 def _accumulate(total: "CallStats", part: "Optional[CallStats]") -> "CallStats":
     """Merge an attempt's reported accounting into total, in place."""
     if part is None:
-        # No accounting is available; leave the aggregate unchanged.
+        # Missing attempt accounting makes invocation token totals incomplete.
+        total.input_complete = False
+        total.output_complete = False
         return total
     total.model_calls += part.model_calls
     total.input_tokens = _add_optional(total.input_tokens, part.input_tokens)
@@ -341,24 +306,17 @@ def _accumulate(total: "CallStats", part: "Optional[CallStats]") -> "CallStats":
     return total
 
 
-def make_parser(return_type, strict: bool, sink: dict, *, answer_format="legacy"):
-    """Parse values and replace sink's parse_status/parse_error on each call."""
-    def parse(text: str):
-        outcome = parse_result_detailed(text, return_type, strict=strict, answer_format=answer_format)
-        sink["parse_status"] = outcome.status
-        sink["parse_error"] = outcome.error
-        return outcome.value
+def _output_type(request: ExecuteRequest) -> Any:
+    """Use the signature's output type unless output checks are disabled."""
+    if ValidationMode.coerce(request.validation_mode) is ValidationMode.NONE:
+        return Any
+    return request.return_type
 
+
+def make_parser(return_type) -> Callable[[str], ParseOutcome]:
+    """Decode a prediction and apply the selected output conversions."""
+    def parse(text: str) -> ParseOutcome:
+        outcome = parse_result(text)
+        outcome.value = coerce_type(outcome.value, return_type)
+        return outcome
     return parse
-
-
-def _is_strict(request) -> bool:
-    """Resolve validation_mode, then strict_types, otherwise WARN.
-
-    Retained for parser compatibility; conversion rules are policy-independent.
-    """
-    mode = getattr(request, "validation_mode", None)
-    if mode is None:
-        mode = getattr(request, "strict_types", None)
-
-    return ValidationMode.coerce(mode, ValidationMode.WARN) is ValidationMode.STRICT

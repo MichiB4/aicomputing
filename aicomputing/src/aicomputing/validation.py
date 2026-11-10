@@ -6,37 +6,53 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, List, get_args, get_origin
 
-from .types import MediaObject, ParsedSignature, validate_type_annotation
+from .types import ParsedSignature, validate_type_annotation
+
+
+def validate_nonblank_text(value: object, label: str, *, optional: bool = False) -> None:
+    """Require nonblank text without rewriting it; optionally allow None."""
+    if value is None and optional:
+        return
+    if not isinstance(value, str):
+        raise TypeError(label + (" must be a string or None" if optional else " must be a string"))
+    if not value.strip():
+        raise ValueError(label + " must be a nonempty string")
+
+
+def validate_bool(value: object, label: str) -> None:
+    """Require a Boolean without converting other values."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{label} must be a bool")
 
 
 # Output validation policy.
 
 class ValidationMode(Enum):
-    """Output policy after retries: STRICT withholds invalid values; WARN returns them.
+    """Output policy: STRICT withholds invalid values; WARN returns diagnostics.
 
-    Both report diagnostics without raising for output-validation failures.
+    NONE preserves parsed values without type conversion or output checks.
+    Output-validation failures are reported rather than raised.
     Mechanical validation and model self-checking do not establish correctness.
     """
 
     STRICT = "strict"
     WARN = "warn"
+    NONE = "none"
 
     @classmethod
     def coerce(
         cls,
-        value: ValidationMode | str | bool | None,
+        value: ValidationMode | str | None,
         default: ValidationMode | None = None,
     ) -> ValidationMode:
-        """Resolve modes, strings, or legacy booleans (True=STRICT, False=WARN).
+        """Resolve an explicit mode or inherit the default, which is STRICT.
 
-        None uses default, falling back to WARN.
+        Boolean aliases are not accepted.
         """
         if value is None:
-            return default if default is not None else cls.WARN
+            value = default if default is not None else cls.STRICT
         if isinstance(value, cls):
             return value
-        if isinstance(value, bool):
-            return cls.STRICT if value else cls.WARN
         if isinstance(value, str):
             try:
                 return cls(value.lower())
@@ -58,25 +74,19 @@ class AIConstraintError(ValueError):
     """Represents an output constraint-validation failure."""
 
 
-class UnsupportedMediaInputError(TypeError):
-    """The prediction flow cannot supply a wrapper's content to the model."""
-
-
 # Type-checking helpers.
 
-def _is_media_type(t: Any) -> bool:
-    try:
-        return t is not Any and isinstance(t, type) and issubclass(t, MediaObject)
-    except TypeError:
-        return False
-
-
 def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
-    """Check supported scalar/container/media annotations; mismatches raise AITypeError.
+    """Check supported scalar/container annotations; mismatches raise AITypeError.
 
-    Generic lists, dictionaries, tuples and sets are checked recursively.
+    Validate the annotation once, then check container values recursively.
     """
     validate_type_annotation(expected)
+    _check_value_type(value, expected, label)
+
+
+def _check_value_type(value: Any, expected: Any, label: str) -> None:
+    """Check a value recursively against an already validated annotation."""
     if expected is Any:
         return
 
@@ -87,15 +97,6 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
         if value is not None:
             raise AITypeError(
                 f"{label}: expected None, got {type(value).__name__}"
-            )
-        return
-
-    # Media types
-    if _is_media_type(expected):
-        if not isinstance(value, expected):
-            raise AITypeError(
-                f"{label}: expected {expected.__name__}, "
-                f"got {type(value).__name__}"
             )
         return
 
@@ -115,23 +116,23 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
         if base is list and args:
             elem_type = args[0]
             for i, item in enumerate(value):
-                check_value_type(item, elem_type, label=f"{label}[{i}]")
+                _check_value_type(item, elem_type, label=f"{label}[{i}]")
 
         elif base is dict and len(args) >= 2:
             k_type, v_type = args[0], args[1]
             for k, v in value.items():
-                check_value_type(k, k_type, label=f"{label}.key({k!r})")
-                check_value_type(v, v_type, label=f"{label}[{k!r}]")
+                _check_value_type(k, k_type, label=f"{label}.key({k!r})")
+                _check_value_type(v, v_type, label=f"{label}[{k!r}]")
 
         elif base is set and args:
             elem_type = args[0]
             for item in value:
-                check_value_type(item, elem_type, label=f"{label}.elem")
+                _check_value_type(item, elem_type, label=f"{label}.elem")
 
         elif base is tuple and args:
             if len(args) == 2 and args[1] is Ellipsis:
                 for i, item in enumerate(value):
-                    check_value_type(item, args[0], label=f"{label}[{i}]")
+                    _check_value_type(item, args[0], label=f"{label}[{i}]")
             else:
                 if len(value) != len(args):
                     raise AITypeError(
@@ -139,7 +140,7 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
                         f"got length {len(value)}"
                     )
                 for i, (item, t) in enumerate(zip(value, args)):
-                    check_value_type(item, t, label=f"{label}[{i}]")
+                    _check_value_type(item, t, label=f"{label}[{i}]")
         return
 
     # Ordinary class annotations, including unparameterized containers.
@@ -167,80 +168,30 @@ def check_value_type(value: Any, expected: Any, label: str = "value") -> None:
 
 # Input validation.
 
-def validate_media_inputs(inputs: Dict[str, Any]) -> None:
-    """Reject media wrappers, including Text, in cycle-safe nested containers.
-
-    Inspect dict keys/values and list/tuple/set/frozenset contents, not arbitrary
-    attributes. Ordinary strings and bytes are not interpreted as media.
-    """
-    pending = [inputs]
-    seen: set[int] = set()
-    while pending:
-        value = pending.pop()
-        if isinstance(value, MediaObject):
-            raise UnsupportedMediaInputError(
-                "MediaObject wrappers, including Text, are not supported by the "
-                "text-only prediction flow; pass ordinary strings for text inputs."
-            )
-
-        if not isinstance(value, (dict, list, tuple, set, frozenset)):
-            continue
-        identity = id(value)
-        if identity in seen:
-            continue
-        seen.add(identity)
-
-        if isinstance(value, dict):
-            pending.extend(value.keys())
-            pending.extend(value.values())
-        else:
-            pending.extend(value)
-
-
 def validate_inputs(
     sig: ParsedSignature,
     inputs: Dict[str, Any],
-    strict: bool = True,
-) -> List[str]:
-    """Check argument names and types against the signature.
-
-    Strict raises on the first mismatch; permissive returns warnings.
-    """
-    warnings: List[str] = []
+) -> None:
+    """Reject invalid argument mappings, names or types before model generation."""
+    if not isinstance(inputs, dict):
+        raise AITypeError("Inputs must be a dictionary of named arguments")
     declared_names = {p.name for p in sig.params}
 
     # Check for missing required arguments.
     for p in sig.params:
         if p.name not in inputs and p.default is None:
-            msg = f"Missing required input: {p.name!r}"
-            if strict:
-                raise AITypeError(msg)
-            warnings.append(msg)
+            raise AITypeError(f"Missing required input: {p.name!r}")
 
     # Check for unexpected arguments.
     for key in inputs:
         if key not in declared_names:
-            msg = f"Unexpected input: {key!r} (not in signature)"
-            if strict:
-                raise AITypeError(msg)
-            warnings.append(msg)
+            raise AITypeError(f"Unexpected input: {key!r} (not in signature)")
 
     # Type-check each provided argument.
     for p in sig.params:
         if p.name not in inputs:
             continue
-        try:
-            check_value_type(
-                inputs[p.name],
-                p.resolved_type,
-                label=f"input '{p.name}'",
-            )
-        except AITypeError as e:
-            if strict:
-                raise
-            warnings.append(str(e))
-
-    return warnings
+        check_value_type(inputs[p.name], p.resolved_type, label=f"input '{p.name}'")
 
 
 # Output validation.
@@ -269,14 +220,42 @@ def validate_output(
 
 @dataclass
 class Constraint:
-    """A named predicate on the output."""
+    """A named output predicate; definition validation never calls it."""
 
     name: str
     predicate: Callable[[Any], bool]
     message: str = ""
 
+    def __post_init__(self) -> None:
+        self.validate_definition()
+
+    def validate_definition(self) -> None:
+        """Check declared fields, including changes made after construction."""
+        validate_nonblank_text(self.name, "Constraint name")
+        if not callable(self.predicate):
+            raise TypeError("Constraint predicate must be callable")
+        if not isinstance(self.message, str):
+            raise TypeError("Constraint message must be a string")
+
     def check(self, value: Any) -> bool:
-        return self.predicate(value)
+        """Run the predicate and require a Boolean result."""
+        result = self.predicate(value)
+        if not isinstance(result, bool):
+            raise TypeError(
+                f"Constraint {self.name!r} predicate must return bool, "
+                f"got {type(result).__name__}"
+            )
+        return result
+
+
+def validate_constraint_definitions(constraints: List[Constraint]) -> None:
+    """Validate all declarations without evaluating any output predicate."""
+    if not isinstance(constraints, list):
+        raise TypeError("constraints must be a list of Constraint objects")
+    for index, constraint in enumerate(constraints):
+        if not isinstance(constraint, Constraint):
+            raise TypeError(f"constraints[{index}] must be a Constraint")
+        constraint.validate_definition()
 
 
 def validate_constraints(
@@ -286,8 +265,10 @@ def validate_constraints(
 ) -> List[str]:
     """Apply predicates: strict raises AIConstraintError; permissive returns failures.
 
-    Predicate exceptions propagate unchanged in either mode.
+    Definitions are checked before any predicate runs. Predicate exceptions
+    propagate unchanged in either mode.
     """
+    validate_constraint_definitions(constraints)
     failures: List[str] = []
     for c in constraints:
         ok = c.check(value)

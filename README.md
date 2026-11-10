@@ -4,6 +4,10 @@
 
 This repository also contains separate evaluation tooling for measuring model and strategy performance. Ordinary package use requires no benchmarks, datasets, manifests, or scoring setup.
 
+The package also offers `strategy="code_execute"`: generate a Python function
+and run it in a standard Python worker. The evaluator uses this same strategy.
+Results retain `generated_code` and `execution_details` alongside the return value.
+
 ## Installation
 
 Requires Python 3.10+. From a cloned repository's root, install the core package:
@@ -12,9 +16,13 @@ Requires Python 3.10+. From a cloned repository's root, install the core package
 python -m pip install ./aicomputing
 ```
 
-The core installation supports Ollama. Install only the extra needed for another backend:
+The core runtime has no required third-party dependencies. Install the extra
+for each backend you want to use:
 
 ```bash
+# Local Ollama server
+python -m pip install "./aicomputing[ollama]"
+
 # OpenAI-compatible hosted APIs or local servers
 python -m pip install "./aicomputing[openai]"
 
@@ -22,9 +30,14 @@ python -m pip install "./aicomputing[openai]"
 python -m pip install "./aicomputing[hf]"
 ```
 
+The OpenAI backend and evaluator require OpenAI SDK 2.30.0 or newer.
+
 ## Use the oracle
 
-For this example, Ollama must be running with the selected model available. Replace `YOUR_INSTALLED_MODEL` with that model's identifier.
+For this example, install the `ollama` extra and run Ollama with the selected
+model available. Replace `YOUR_INSTALLED_MODEL` with that model's identifier.
+Pass the backend explicitly to `VirtualRuntime`; the `aicomp` command likewise
+requires `--backend`.
 
 ```python
 from aicomputing import ExecuteRequest, VirtualRuntime
@@ -48,32 +61,42 @@ print(prediction.result)             # Expected: "A.L"
 print(prediction.validation_status)
 ```
 
-The package returns a prediction and diagnostics. Structural validation checks types and optional constraints; it does not prove that the model's answer is correct.
+The package checks caller inputs and defaults to strict output validation.
+Declare the output type in the function signature, for example `-> str` or
+`-> list[int]`. A signature without a return annotation allows any decoded type.
+Use `validation_mode="warn"` to return invalid outputs with diagnostics or
+`"none"` to preserve parsed values without output checks. Structural validation
+checks types and optional constraints; it does not prove that an answer is correct.
+
+Result caching is disabled by default. For repeated identical requests in a
+long-lived runtime, opt in with a positive `cache_size`, such as `cache_size=128`.
 
 ## Documentation
 
 - [Package guide](aicomputing/README.md): API, strategies, backends, validation, caching, tracing, and CLI.
-- [Evaluation workflow](evaluation/README.md): prepare, verify, execute and audit frozen experiments.
+- [Evaluation workflow](evaluation/README.md): run selected benchmarks with one command and receive one detailed CSV and one JSON.
 - [Benchmark reference](docs/evaluation.md): benchmark data, selection and scoring.
+- [Reviewed dataset](data/README.md): bundled release, checksum, provenance and upstream notices.
 
-All seven package strategies are available independently of the subset selected for an experiment.
+The package's registered strategies are available independently of the subset selected for an experiment.
 
 ## Repository structure
 
 ```text
 aicomputing/src/aicomputing/  # Installable oracle package
-aicomputing/benchmarks/      # Data adapters, grading and selection
-evaluation/                 # Audited preparation, execution and analysis
+evaluation/                 # Single-command evaluation and shared helpers
+evaluation/benchmarks/      # Reviewed data, task selection, grading and result rows
 docs/evaluation.md          # Benchmark data and scoring
-scripts/                    # Data preparation and local-model evaluation
-manifests/prepared/          # Frozen experiment inputs (local, ignored)
-runs/                       # Run snapshots and results (local, ignored)
+data/dataset-release.json   # Bundled reviewed benchmark data
+results/                    # One CSV and JSON per evaluation (local, ignored)
 ```
 
 ## Status
 
-The oracle runtime and evaluation tooling are implemented. Model predictions remain probabilistic. Future evaluations use the [reproducible workflow](evaluation/README.md), with frozen input bundles and separate run directories. Historical evaluations remain local and unchanged.
+The oracle runtime and evaluation tooling are implemented. Model predictions remain probabilistic. The [evaluation command](evaluation/README.md) selects reviewed inputs, runs the requested approaches, and saves results and resumable progress in two files.
 
 ## License
 
-MIT
+The package and evaluation code are [MIT-licensed](aicomputing/LICENSE).
+Benchmark data retains the upstream terms
+documented in [data/README.md](data/README.md).

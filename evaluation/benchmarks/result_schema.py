@@ -1,29 +1,55 @@
-"""Canonical rows for manifest-driven evaluations.
+"""Canonical rows for evaluation results.
 
 Graders supply correctness. Structural checks do not establish semantics, and
 explicit failures take precedence over answer comparisons.
 Unavailable token usage remains unknown.
 
-Frozen manifests retain invocation/provenance details. Paired analysis requires
-matching inputs and settings. retries combines validation and audited timeouts;
-token-budget retry detail is omitted. Historical files keep their original schema."""
+Paired analysis requires matching inputs and settings. retries combines
+validation and recorded API retries.
+Historical files keep their original schema."""
 
 from __future__ import annotations
 
-import csv
 import json
-import os
-import stat
-import tempfile
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
-from uuid import uuid4
+from typing import Any, Dict, List, Optional
 
 from aicomputing.request import ExecuteResult, FailureType
-from aicomputing.answer_protocol import FRAMED_TEXT_V1
-from aicomputing.parsing import ParseOutcome
+from aicomputing.status import ParseStatus, ValidationStatus
 from aicomputing.types import parse_signature
 from aicomputing.validation import validate_output
+
+# These labels and accuracy rules belong to evaluation, not execution results.
+# policy_rejected remains recognized when reading historical worker results.
+SEMANTIC_WRONG_ANSWER = "semantic_wrong_answer"
+REFERENCE_TYPE_MISMATCH = "reference_type_mismatch"
+_CODE_FAILURES = frozenset("code_" + status for status in (
+    "format_error", "syntax_error", "policy_rejected", "runtime_error",
+    "serialization_error", "timeout",
+))
+_OUTPUT_FAILURES = frozenset({
+    SEMANTIC_WRONG_ANSWER, REFERENCE_TYPE_MISMATCH, FailureType.PARSE,
+    FailureType.STRUCTURAL_VALIDATION, FailureType.CONSTRAINT_VALIDATION,
+}) | _CODE_FAILURES
+_INFRASTRUCTURE_FAILURES = frozenset({
+    FailureType.PROVIDER_ERROR, FailureType.TIMEOUT, FailureType.HARNESS_ERROR,
+})
+FAILURE_TYPES = _OUTPUT_FAILURES | _INFRASTRUCTURE_FAILURES
+
+
+def is_scorable(failure_type: str | None) -> bool:
+    """Include successes and output failures; exclude infrastructure failures.
+
+    Unknown labels are rejected so new failure types require an explicit policy.
+    """
+    if failure_type is None:
+        return True
+    if not isinstance(failure_type, str):
+        raise TypeError("failure_type must be a string or None")
+    if failure_type == "" or failure_type in _OUTPUT_FAILURES:
+        return True
+    if failure_type in _INFRASTRUCTURE_FAILURES:
+        return False
+    raise ValueError(f"Unknown failure type: {failure_type!r}")
 
 # Canonical column order for newly written CSV files.
 # Consumers should address columns by name; older files may use an earlier schema.
@@ -45,6 +71,11 @@ RESULT_COLUMNS: List[str] = [
     "failure_type",
     "parse_status",
     "parse_error",
+    "provider_finish_reason",
+    "verdict_parse_status",
+    "verdict_parse_error",
+    "verdict_finish_reason",
+    "execution_error",
     "contract_status",
     "latency_ms",
     "input_tokens",
@@ -75,18 +106,32 @@ def _json(value: Any) -> str:
 
 
 def derive_failure_type(result: ExecuteResult, correct: bool) -> Optional[str]:
-    """Classify a benchmark outcome without replacing explicit failures.
+    """Map execution evidence to benchmark outcomes, preserving explicit failures.
 
-    Validate existing failure labels first, then use grader-supplied correctness.
+    Expand the package's execution label using required worker diagnostics.
+    Validate other failure labels before using grader-supplied correctness.
     Scoring eligibility is determined separately when building the row.
     """
-    # Validate explicit labels even when they are falsy or already excluded.
-    FailureType.is_scorable(result.failure_type)
+    execution = result.execution_details
+    if result.failure_type == FailureType.EXECUTION:
+        if execution is None or execution["status"] == "ok":
+            raise ValueError("execution_failure requires failed worker diagnostics")
+    else:
+        # Validate explicit labels even when they are falsy or already excluded.
+        is_scorable(result.failure_type)
+    if result.failure_type in _INFRASTRUCTURE_FAILURES:
+        return result.failure_type
+    if execution is not None and execution["status"] != "ok":
+        if execution["status"] == "harness_error":
+            return FailureType.HARNESS_ERROR
+        failure = "code_" + execution["status"]
+        is_scorable(failure)
+        return failure
     if result.failure_type:
         return result.failure_type
 
     if not correct:
-        return FailureType.SEMANTIC_WRONG_ANSWER
+        return SEMANTIC_WRONG_ANSWER
     return FailureType.SUCCESS
 
 
@@ -104,11 +149,14 @@ def _reference_types_compatible(predicted, expected):
 
 def _structural_validity(result, signature):
     """Check only a public return annotation, without converting the answer."""
+    execution = result.execution_details
+    recovered = (execution["status"] == "ok" if execution is not None
+                 else result.parse_status in (ParseStatus.PARSED, ParseStatus.FALLBACK))
     if (
-        result.parse_status not in (ParseOutcome.PARSED, ParseOutcome.FALLBACK)
+        not recovered
         or result.failure_type == FailureType.PARSE
-        or result.failure_type in FailureType.INFRASTRUCTURE
-        or result.validation_status == "unparsed"
+        or result.failure_type in _INFRASTRUCTURE_FAILURES
+        or result.validation_status == ValidationStatus.UNPARSED
     ):
         return "not_assessed"
     try:
@@ -142,22 +190,20 @@ def build_row(
         else "revised" if result.revised else "unchanged"
     )
     failure = derive_failure_type(result, correct) or ""
+    execution = result.execution_details
+    # Unconverted text predictions and executed code are checked only here.
+    assessed = result.validation_status == ValidationStatus.NOT_CHECKED or execution is not None
     structural_status = (
-        _structural_validity(result, signature)
-        if result.answer_format == FRAMED_TEXT_V1
-        else "not_assessed"
+        _structural_validity(result, signature) if assessed else "not_assessed"
     )
-    if (
-        result.answer_format == FRAMED_TEXT_V1
-        and failure == FailureType.SEMANTIC_WRONG_ANSWER
-    ):
+    if assessed and failure == SEMANTIC_WRONG_ANSWER:
         if structural_status == "invalid":
             failure = FailureType.STRUCTURAL_VALIDATION
         elif not _reference_types_compatible(result.result, expected):
-            failure = FailureType.REFERENCE_TYPE_MISMATCH
-    if failure == FailureType.PARSE:
+            failure = REFERENCE_TYPE_MISMATCH
+    if failure:
         correct = False
-    failure_scorable = FailureType.is_scorable(failure)
+    failure_scorable = is_scorable(failure)
     gen = generation or {}
     return {
         "run_id": run_id,
@@ -172,15 +218,20 @@ def build_row(
         "predicted": _json(result.result),
         "correct": correct,
         # Infrastructure failures do not enter capability accuracy.
-        "scorable": result.scorable and failure_scorable,
+        "scorable": failure_scorable,
         "validation_status": result.validation_status,
         "structural_validity": structural_status,
         "failure_type": failure,
         "parse_status": result.parse_status or "",
         "parse_error": result.parse_error or "",
+        "provider_finish_reason": result.provider_finish_reason or "",
+        "verdict_parse_status": result.verdict_parse_status or "",
+        "verdict_parse_error": result.verdict_parse_error or "",
+        "verdict_finish_reason": result.verdict_finish_reason or "",
+        "execution_error": result.execution_error or "",
         "contract_status": contract_status,
-        # Record integer milliseconds; missing latency currently defaults to zero.
-        "latency_ms": round(result.latency_ms or 0.0),
+        # Record integer milliseconds; missing latency stays unknown.
+        "latency_ms": None if result.latency_ms is None else round(result.latency_ms),
         "input_tokens": result.input_tokens,
         "output_tokens": result.output_tokens,
         "total_tokens": result.total_tokens,
@@ -200,69 +251,3 @@ def build_row(
         "answer_format": result.answer_format,
         "transport_diagnostics": _json(result.transport_diagnostics),
     }
-
-
-def write_results(path: str, rows: Iterable[Dict[str, Any]]) -> str:
-    """Write a complete CSV before replacing the destination.
-
-    Unknown fields raise; missing fields are written as blanks.
-    Existing permission bits are preserved; new files use temporary-file defaults.
-    """
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-
-    try:
-        existing_mode = stat.S_IMODE(os.stat(path).st_mode)
-    except FileNotFoundError:
-        existing_mode = None
-
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            newline="",
-            encoding="utf-8",
-            dir=directory,
-            prefix=".results-",
-            suffix=".csv",
-            delete=False,
-        ) as fh:
-            temporary_path = fh.name
-            writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
-
-        if existing_mode is not None:
-            os.chmod(temporary_path, existing_mode)
-
-        os.replace(temporary_path, path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            try:
-                os.unlink(temporary_path)
-            except PermissionError:
-                if os.name != "nt":
-                    raise
-                # Windows cannot delete a read-only temporary output.
-                os.chmod(temporary_path, stat.S_IWRITE)
-                os.unlink(temporary_path)
-
-    return path
-
-
-def new_run_id(model: str, benchmark: str, strategy: str) -> str:
-    """Combine a UTC timestamp, readable labels and a random run identifier."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    def safe(value: str) -> str:
-        return "".join(
-            character if character.isalnum() or character in "-._" else "-"
-            for character in value
-        )
-
-    return (
-        f"{stamp}_{safe(model)}_{safe(benchmark)}_{safe(strategy)}"
-        f"_{uuid4().hex}"
-    )

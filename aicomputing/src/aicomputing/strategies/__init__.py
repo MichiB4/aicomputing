@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..validation import validate_nonblank_text
 from .base import Strategy, StrategyResult
 from .direct import DirectStrategy
 from .cot import CoTStrategy
@@ -10,6 +11,7 @@ from .contract import ContractStrategy
 from .hybrid import HybridStrategy
 from .confidence import ConfidenceStrategy
 from .consistency import SelfConsistencyStrategy
+from .code_execute import CodeExecuteStrategy, CodeExecutionError
 
 __all__ = [
     "Strategy",
@@ -21,12 +23,13 @@ __all__ = [
     "HybridStrategy",
     "ConfidenceStrategy",
     "SelfConsistencyStrategy",
+    "CodeExecuteStrategy",
+    "CodeExecutionError",
     "create_strategy",
     "list_strategies",
-    "list_arms",
 ]
 
-# Preserve this order when listing strategies and default evaluation arms.
+# Preserve this order when listing strategies.
 _REGISTRY: dict[str, type[Strategy]] = {
     "direct": DirectStrategy,
     "cot": CoTStrategy,
@@ -35,20 +38,12 @@ _REGISTRY: dict[str, type[Strategy]] = {
     "confidence": ConfidenceStrategy,
     "consistency": SelfConsistencyStrategy,
     "hybrid": HybridStrategy,
+    "code_execute": CodeExecuteStrategy,
 }
-
-# Excluded from default evaluation arms, but available through the registry.
-_NON_ARM = frozenset({"hybrid", "consistency"})
-
 
 def list_strategies() -> list[str]:
     """Return all registered strategy names in registry order."""
     return list(_REGISTRY)
-
-
-def list_arms() -> list[str]:
-    """Return registered strategy names except _NON_ARM, preserving order."""
-    return [name for name in _REGISTRY if name not in _NON_ARM]
 
 
 def create_strategy(name: str, **kwargs) -> Strategy:
@@ -59,6 +54,7 @@ def create_strategy(name: str, **kwargs) -> Strategy:
 
     >>> strategy = create_strategy("cot")
     """
+    validate_nonblank_text(name, "strategy")
     cls = _REGISTRY.get(name)
     if cls is None:
         raise ValueError(

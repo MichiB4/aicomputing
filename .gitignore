@@ -1,5 +1,7 @@
 # Workspace-generated files
 .pytest_cache/
+.ruff_cache/
+.venv/
 __pycache__/
 *.py[cod]
 
@@ -42,9 +44,30 @@ pre-reroot-*
 /results/
 /aicomputing/results/
 /exports/
-/data/
-/tests/
 /scripts/verify_experiment.py
+
+# Include the reviewed release and its documentation; keep other data local.
+/data/*
+!/data/dataset-release.json
+!/data/README.md
+!/data/THIRD_PARTY_NOTICES.txt
 
 # Locally prepared, self-contained experiment inputs
 /manifests/prepared/
+
+# Local-only development and maintenance
+/tests/
+/scripts/
+/.github/
+/pytest.ini
+/ruff.toml
+/archives/
+
+# Packaging and coverage artifacts
+*.egg-info/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

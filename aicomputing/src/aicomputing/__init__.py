@@ -10,22 +10,19 @@ Quick start::
             signature="sort(arr: list[int]) -> list[int]",
             docstring="Return a sorted copy of the array.",
             inputs={"arr": [5, 3, 1, 4]},
-            return_type=list,
         ))
     print(result.result)  # [1, 3, 4, 5]
 """
 
 from .version import __version__
 from .request import ExecuteRequest, ExecuteResult
+from .status import ParseStatus, ValidationStatus
 from .runtime import VirtualRuntime
-from .validation import Constraint, AITypeError, AIConstraintError
+from .validation import Constraint, AITypeError, AIConstraintError, ValidationMode
 from .backends.base import ToolUseDetected
-from .types import (
-    Image, Audio, Video, Text, MediaObject, Modality,
-    parse_signature, ParsedSignature,
-)
+from .types import parse_signature, ParsedSignature
 from .backends import create_backend, Backend
-from .strategies import create_strategy, Strategy
+from .strategies import create_strategy, Strategy, CodeExecutionError
 from .trace import Tracer
 
 __all__ = [
@@ -34,18 +31,16 @@ __all__ = [
     "VirtualRuntime",
     "ExecuteRequest",
     "ExecuteResult",
+    "ParseStatus",
+    "ValidationStatus",
     # Validation
     "Constraint",
+    "ValidationMode",
     "AITypeError",
     "ToolUseDetected",
+    "CodeExecutionError",
     "AIConstraintError",
     # Types
-    "Image",
-    "Audio",
-    "Video",
-    "Text",
-    "MediaObject",
-    "Modality",
     "parse_signature",
     "ParsedSignature",
     # Factories
@@ -53,4 +48,6 @@ __all__ = [
     "create_strategy",
     "Backend",
     "Strategy",
+    # Tracing
+    "Tracer",
 ]

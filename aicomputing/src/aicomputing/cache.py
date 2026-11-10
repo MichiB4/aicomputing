@@ -15,6 +15,7 @@ from copy import deepcopy
 from typing import Any, Dict, Optional, get_args, get_origin
 
 from .request import ExecuteResult
+from .status import ParseStatus, ValidationStatus
 
 
 def _encode(value: Any, active: set[int]) -> Any:
@@ -24,6 +25,8 @@ def _encode(value: Any, active: set[int]) -> Any:
     arbitrary objects. Type annotations are supported for cache context.
     """
     kind = type(value)
+    if kind in (ParseStatus, ValidationStatus):
+        return ["status", kind.__name__, value.value]
     if value is None:
         return ["none"]
     if value is Any:

@@ -4,8 +4,9 @@ Selects the most frequent recovered value matching the expected return type,
 with ties resolved by first occurrence. Any leaves voting unrestricted.
 None participates when its type is allowed; failed recovery does not vote.
 The selected sample supplies answer text and parsing metadata, while
-usage and token-budget retry counts are accumulated across samples.
-Every sample requests temperature=0.0, regardless of the request setting.
+usage is accumulated across samples.
+Samples use the request's temperature; at 0.0 a deterministic provider returns
+identical samples, so use a positive temperature for meaningful voting.
 Native reasoning is configured by the backend rather than selected by
 this strategy.
 Samples have no application output-token cap unless the request supplies one.
@@ -17,17 +18,19 @@ from __future__ import annotations
 from typing import Any, List, Optional, Tuple
 
 from ..backends.base import Backend
-from ..parsing import ParseOutcome
-from ..prompting import build_cot_prompt, build_retry_prompt
+from ..status import ParseStatus
+from ..prompting import build_cot_prompt
 from ..request import ExecuteRequest
-from ..validation import validate_output
+from ..validation import validate_bool, validate_output
 from .base import (
     CallStats,
     Strategy,
     StrategyResult,
-    _is_strict,
+    _backend_call,
+    _output_type,
     _same_value,
-    generate_with_retry,
+    _with_feedback,
+    _generate_once,
     make_parser,
 )
 
@@ -40,6 +43,7 @@ class SelfConsistencyStrategy(Strategy):
             raise TypeError("n_samples must be an integer")
         if n_samples <= 0:
             raise ValueError("n_samples must be positive")
+        validate_bool(include_fewshot, "include_fewshot")
         self._n_samples = n_samples
         self._include_fewshot = include_fewshot
 
@@ -53,74 +57,36 @@ class SelfConsistencyStrategy(Strategy):
         backend: Backend,
         feedback: Optional[dict] = None,
     ) -> StrategyResult:
-        prompt = build_cot_prompt(
+        prompt = _with_feedback(build_cot_prompt(
             signature=request.signature,
             docstring=request.docstring,
             inputs=request.inputs,
             include_fewshot=self._include_fewshot,
-            answer_format=request.answer_format,
-        )
-        if feedback:
-            prompt = build_retry_prompt(
-                original_prompt=prompt,
-                raw_output=feedback.get("raw_output", ""),
-                error_message=feedback.get("error", ""),
-                answer_format=request.answer_format,
-            )
+        ), feedback)
+        call = _backend_call(request, backend, prompt)
+        return_type = _output_type(request)
+        parse = make_parser(return_type)
 
-        # None leaves output length to the provider rather than a strategy cap.
-        initial_budget = request.max_new_tokens
-
-        def call(max_new_tokens: Optional[int]):
-            return backend.generate(
-                prompt,
-                model=request.model,
-                temperature=0.0,
-                top_p=request.top_p,
-                max_new_tokens=max_new_tokens,
-            )
-
-        # Accumulate returned-response usage across samples and token retries.
+        # Accumulate usage across all planned samples, including truncated ones.
         stats = CallStats()
         samples: List[StrategyResult] = []
-        strict = _is_strict(request)
         for _ in range(self._n_samples):
-            # A fresh sink prevents another sample from overwriting the
-            # parsing status of the answer eventually selected by voting.
-            psink: dict = {}
-            parse = make_parser(request.return_type, strict, psink, answer_format=request.answer_format)
-            value, response, retries, final_budget = generate_with_retry(
+            outcome, response = _generate_once(
                 call=call,
                 parse=parse,
-                initial_budget=initial_budget,
-                model_name=request.model or backend.default_model,
                 stats=stats,
             )
             samples.append(StrategyResult(
-                value=value,
+                value=outcome.value,
                 raw_text=response.text,
-                tokens_used=response.tokens_used,
+                feedback_text=response.parsing_text,
                 provider_finish_reason=response.provider_finish_reason,
-                token_budget_used=final_budget,
-                retries=retries,
-                parse_status=psink.get("parse_status"),
-                parse_error=psink.get("parse_error"),
+                parse_status=outcome.status,
+                parse_error=outcome.error,
             ))
 
-        winner, vote_count = _majority_vote(
-            samples, return_type=request.return_type,
-        )
-        reported_tokens = [
-            sample.tokens_used
-            for sample in samples
-            if sample.tokens_used is not None
-        ]
-        total_tokens = sum(reported_tokens) if reported_tokens else None
-        total_retries = sum(sample.retries for sample in samples)
-        # Any uncapped sample makes the combined allowance uncapped.
-        budgets = [sample.token_budget_used for sample in samples]
-        max_budget = (
-            None if any(budget is None for budget in budgets) else max(budgets)
+        winner, vote_count = _select_most_frequent(
+            samples, return_type=return_type,
         )
 
         return StrategyResult(
@@ -131,17 +97,18 @@ class SelfConsistencyStrategy(Strategy):
                 f"[consistency {vote_count}/{self._n_samples}] "
                 f"{winner.raw_text}"
             ),
-            tokens_used=total_tokens,
+            feedback_text=(
+                f"[consistency {vote_count}/{self._n_samples}] "
+                f"{winner.feedback_text}"
+            ),
             provider_finish_reason=winner.provider_finish_reason,
-            token_budget_used=max_budget,
-            retries=total_retries,
             call_stats=stats,
             parse_status=winner.parse_status,
             parse_error=winner.parse_error,
         )
 
 
-def _majority_vote(
+def _select_most_frequent(
     samples: List[StrategyResult],
     *,
     return_type: Any = None,
@@ -154,7 +121,7 @@ def _majority_vote(
     """
     counted = [
         sample for sample in samples
-        if sample.parse_status in (ParseOutcome.PARSED, ParseOutcome.FALLBACK)
+        if sample.parse_status in (ParseStatus.PARSED, ParseStatus.FALLBACK)
         and not validate_output(sample.value, return_type, strict=False)
     ]
     if not counted:

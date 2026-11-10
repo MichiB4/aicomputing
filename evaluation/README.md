@@ -1,135 +1,211 @@
-# Reproducible evaluation workflow
+# Run an evaluation with one command
 
-This research tooling is separate from the installable oracle package. The
-current runner supports GPT-6 Luna, HumanEval+, MBPP+, GSM8K, and the Direct,
-CoT, Pseudocode and Contract strategies.
+First install this checkout in editable mode from the repository root:
 
-## 1. Install and obtain the reviewed data
-
-From the repository root:
-
-```bash
-python -m pip install "./aicomputing[openai,benchmarks]"
+```powershell
+python -m pip install -e "./aicomputing[openai,benchmarks]"
 ```
 
-Use the approved `dataset-release.json` supplied for the study. Preparation
-copies its exact bytes; it does not download raw datasets, change task text,
-repair targets, or use model responses for selection.
+The evaluator requires OpenAI SDK 2.30.0 or newer.
+The `benchmarks` extra optionally enables system certificates for HTTPS calls.
+Evaluation checks that the imported package comes from this checkout so its
+recorded source hashes describe the code actually used.
 
-For new MBPP+ data preparation, the [published-target migration](../docs/evaluation.md#mbpp)
-traces existing reviewed inputs to the dataset's literal output lists. It creates
-a separate release and preserves all earlier releases/results. Inference needs no reference-execution cache.
+Then run:
 
-## 2. Prepare a new experiment, offline
-
-```bash
-python -m evaluation.prepare --dataset-release "<path-to-approved-dataset-release.json>" --experiment-id luna-smoke --cases-per-benchmark 5 --out-dir manifests/prepared/luna-smoke --budget-usd 1.00 --user-ceiling-usd 1.00
+```powershell
+python -m evaluation --model gpt-6-luna --samples 100 --output results/luna-none
 ```
 
-The new directory contains `manifest.json`, `dataset-release.json`, and
-`requirements.txt`. Existing directories are rejected. The manifest freezes
-source hashes, Python and runtime dependency versions, model settings, selected
-inputs, grading fingerprints, timeout/retry policy, price assumptions and budget.
+This runs HumanEval+, MBPP+, and GSM8K with Direct, CoT, Pseudocode, Contract,
+and code generation followed by execution. It writes exactly two result files:
 
-The default seed is 42. Preparation first selects 100 cases per benchmark;
-the five-case smoke test uses the first five of that same selection. For a full
-study, repeat preparation with `--cases-per-benchmark 100`, a new experiment
-ID and a new output directory. Reuse the seed and reviewed release to preserve
-the selections. These public development cases are not an unseen holdout.
+- `results/luna-none.csv`: one row per selected task/approach, including inputs,
+  expected and predicted answers, correctness, errors, prompts, raw responses,
+  generated code, execution details, timing, tokens, costs, and attempt/session history.
+- `results/luna-none.json`: settings, provenance, the selected tasks and inputs,
+  summaries, request details, attempt history, and progress for resuming the run.
 
-Five cases produce 60 evaluations and 75 nominal model calls; 100 cases produce
-1,200 evaluations and 1,500 nominal calls. Timeout retries can increase those
-figures to 225 and 4,500 attempts respectively, subject to the frozen budget.
-No inference occurs during preparation.
+The evaluator assigns correctness, benchmark failure labels, and `scorable`
+eligibility from the returned values and execution diagnostics. These scoring
+fields are retained in the CSV/JSON outputs.
 
-## 3. Verify before inference
+Prediction-parsing diagnostics use `parse_status` and `parse_error`. Generated
+code uses `execution_error` and execution details instead; its parsing fields
+are empty. These diagnostics do not change benchmark failure labels or scoring.
+Historical result files retain their original columns and values.
 
-```bash
-python -m evaluation.runner --manifest manifests/prepared/luna-smoke/manifest.json --preflight-only
+Invalid Unicode in generated source is recorded as a code syntax failure; the
+run continues. JSON and JSON-encoded CSV histories preserve the original text.
+Standalone CSV text fields escape invalid Unicode characters as `\ud800`-style
+sequences so the CSV remains valid UTF-8.
+
+Input verification, selection, scoring, and checkpoints happen inside the command.
+
+Concurrent commands targeting the same output are rejected using a persistent
+lock file under the system temporary folder's `aicomputing-evaluation-locks`
+directory. The result folder still contains only the CSV and JSON. A lock file's
+presence does not mean a run is active: the operating system releases the lock
+when the process closes it or exits.
+
+The checkout includes the reviewed dataset at `data/dataset-release.json`; normal
+evaluation needs no separate dataset download or preparation. Its release identity,
+checksum and upstream notices are documented in [the data guide](../data/README.md).
+For another reviewed release, supply `--dataset-release path/to/dataset-release.json`.
+The command does not silently substitute raw data.
+There are no per-run source/dataset copies, generated-program files, manifests,
+or separate log directories.
+
+## Choose benchmarks, approaches, and settings
+
+All five approaches use the package's `VirtualRuntime` strategy interface,
+including `code_execute`. Source generation and the standard Python worker live
+in the package. Evaluation supplies benchmark data, selects `word_problem` mode
+for GSM8K, and records and scores the returned evidence. The worker uses the
+application's Python interpreter, installed packages and normal permissions.
+
+Evaluation explicitly uses `validation_mode="none"` and zero validation retries.
+The runtime preserves parsed outputs and reports `not_checked`; the evaluator
+assesses types and correctness against the reviewed benchmark data.
+
+Prediction strategies use one final-answer block. A clearly isolated malformed
+result such as `{"result": 7?}` is preserved as the text `"7?"` and graded as
+returned. Missing, empty, or ambiguous answers are parse failures. Full raw
+responses are retained for both outcomes.
+
+```powershell
+python -m evaluation --model gpt-6-luna --reasoning max --benchmarks humaneval_plus mbpp_plus gsm8k --strategies direct cot pseudocode contract code_execute --samples 100 --timeout 900 --retries 1 --budget 20 --output results/luna-max
 ```
 
-This checks software versions, source hashes, input hashes, selected content and
-the frozen execution policy. It needs no credential and creates no run directory.
-To restore the recorded environment, use the Python version in the manifest and:
+`--samples` is the number of tasks **per benchmark**. Any positive size up to the
+approved pool size is accepted. Each task uses one input, shared across all selected
+approaches. With the same seed and data, selections match across models; smaller
+samples are prefixes of larger samples. The default seed is 42.
 
-```bash
-python -m pip install -r manifests/prepared/luna-smoke/requirements.txt
+One hundred tasks across three benchmarks and five approaches give 1,500 evaluation
+rows. Contract normally makes two model calls per evaluation, so this configuration
+has 1,800 nominal API calls before retries for temporary API failures.
+
+Frequently used options:
+
+| Option | Default / meaning |
+| --- | --- |
+| `--model` | `gpt-6-luna`; Sol, Terra, Cerebras Qwen, and local Qwen profiles also work |
+| `--benchmarks` | `humaneval_plus mbpp_plus gsm8k`; choose any subset |
+| `--strategies` / `--approaches` | All five approaches; choose any subset |
+| `--samples` | 100 per benchmark |
+| `--reasoning` | `none`; native effort, independent of the prompting approach |
+| `--temperature`, `--top-p` | 0 and 1 with reasoning off; omitted with native reasoning enabled |
+| `--max-output-tokens` | No application cap; a supplied cap includes native reasoning tokens |
+| `--timeout` | HTTP phase timeout: 180 seconds without reasoning, 900 with reasoning |
+| `--retries` | One additional attempt on temporary API failures; no parse/validation/repair retries |
+| `--execution-timeout`, `--execution-retries` | Code worker limits; inherit timeout/retries unless explicitly set |
+| `--budget` | USD 20 conservative total guard, including previous attempts when resuming/retrying |
+| `--output` | Required output basename; also accepts a `.csv` or `.json` suffix |
+
+Temporary API failures include timeouts, connection errors, and HTTP 408, 409,
+429 and 5xx responses. Retries wait 1, 2, 4, then at most 8 seconds between calls.
+Every call retains its request history and cost accounting; failed calls with
+unknown usage retain their conservative reservation. Request history also records
+whether a retry was scheduled and its planned delay. If temporary failures exhaust
+the retry limit, that evaluation is an infrastructure exclusion and the run
+continues. Authentication and other permanent request errors stop the run.
+The SDK's own retries remain disabled.
+
+GPT-6.1 Sol requires `--reasoning low` or a higher effort; it does not support `none`.
+
+Token-cap exhaustion is recorded as an invalid output; the runner never silently
+increases the cap. Raw code is compiled and executed through the standard Python
+worker. The current general syntax and semantic code-review prompt is used.
+
+Use `OPENAI_API_KEY` or `CEREBRAS_API_KEY`, or provide a named assignment file with
+`--key-file .env.local`. Local Ollama models require no key. Credentials are not
+written into the results. The standard hosted profiles include recorded price
+assumptions. For another model, specify `--provider`, `--input-price` and
+`--output-price` in USD per million tokens, and either an application token cap or
+`--provider-output-tokens`. `--base-url` supports a custom endpoint.
+
+Preview selections and counts without inference or result files:
+
+```powershell
+python -m evaluation --model gpt-6-luna --samples 10 --output results/preview --dry-run
 ```
 
-Platform information is recorded separately. Matching versions and settings
-does not guarantee identical hosted model outputs. Deliberate software changes
-require a new preparation; never rewrite an old experiment to pass a check.
+## Optional saved configuration
 
-## 4. Run into a new directory
+The example configuration contains the same settings as the flags:
 
-Supply `OPENAI_API_KEY` through the environment or an ignored local key file:
-
-```bash
-python -m evaluation.runner --manifest manifests/prepared/luna-smoke/manifest.json --output-dir runs/luna-smoke-001 --key-file .env.local
+```powershell
+python -m evaluation --config evaluation/example-config.json
+python -m evaluation --config evaluation/example-config.json --samples 100 --output results/full
 ```
 
-Each request retains the 60-second HTTP phase timeout and up to two timeout
-retries. Parsing and validation never trigger retries. No application output
-token cap is sent, no tools are offered, and native reasoning effort is `none`.
-The timeout is not a total wall-clock deadline. Price estimates retain the
-reviewed assumptions dated 2026-10-26; they are not a fresh billing quotation.
+Explicit flags override configuration values. Paths inside a configuration file
+are relative to that file. Only the CSV and JSON are run outputs; the configuration
+file is optional input.
 
-A run snapshots the exact validated manifest, dataset, requirements, runner,
-maintained source files and project metadata. Its metadata records the actual
-software environment. Results, request logs and summaries stay in that new
-directory. Reruns use another new directory; no automatic resume or overwrite
-is supported. CLI budget overrides must equal the frozen manifest values.
+## Resume or retry in the same two files
 
-The per-result CSV and JSONL rows use a compact 35-column schema. Task identity,
-specifications, inputs, expected and predicted values, outcome diagnostics,
-token totals, generation settings, prompts, and reasoning/transport records
-remain in each row. The consolidated fields are:
+Ctrl+C checkpoints the current progress. Resume unfinished evaluations with:
 
-| Field | Values and meaning |
-|---|---|
-| `structural_validity` | `valid`, `invalid`, or `not_assessed`; checks a public return annotation without converting the prediction |
-| `contract_status` | `not_checked`, `unchanged`, or `revised`; records whether a completed check changed the answer, without claiming it is correct |
-| `retries` | Validation retries plus timeout retries for this evaluation; excludes the removed token-budget retry detail |
-
-`benchmark_item_id` identifies the selected task. Its invocation ID, selection
-seed, dataset revision, and other run-level provenance remain in the frozen
-manifest. Per-request logs retain physical attempt counts and partial reported
-usage for cost auditing. If usage is incomplete, the row's token totals remain
-unknown (blank in CSV), never zero-filled. Pre-revision values and scores are
-omitted from new result rows and are not separately scored by the runner.
-Historical files retain their original columns; the new format requires a
-freshly prepared, source-pinned manifest.
-
-## 5. Audit the completed run, offline
-
-```bash
-python -B -m evaluation.audit --run-dir runs/luna-smoke-001
+```powershell
+python -m evaluation --output results/luna-max --resume
 ```
 
-The command prints a JSON report and exits with code 0 for PASS or 1 for FAIL.
-It reads the run directory without changing it, importing archived code,
-restoring the old SDK environment, or making model calls. It supports completed
-runs from the current workflow (runner schema 7).
+Completed evaluations are skipped. An interrupted evaluation starts again, preserving
+its earlier calls and any unknown-usage reservation. The JSON contains the selected
+task data, so resuming does not require the original dataset file. It does require
+the original package and evaluation source code, model settings, and task selection.
+Both resume and retry compare the current source files and package configuration
+against the original run's recorded hashes; replacement fingerprints cannot
+override this check. Source changes require the original checkout or a new output
+basename. Saved results remain readable. Operational timeouts, retry limits, and
+the total budget may be adjusted explicitly.
 
-The audit checks frozen snapshots, selected-case coverage, CSV/JSONL agreement,
-request and retry evidence, reported usage, price calculations, budget
-reservations and summary totals. Unknown usage remains unknown and retains
-its reservation. Infrastructure exclusions stay outside the accuracy
-denominator; accuracy is null when no evaluation is scorable.
+JSON and CSV saves briefly retry permission conflicts during file replacement.
+If saving the dispatch checkpoint fails, the request is not sent and receives no
+usage reservation charge. Calls that may have reached the provider retain their
+conservative reservation when usage is unknown. Failed sessions retain their
+exception type and traceback in JSON and the CSV's `session_history` after resume;
+exception messages are omitted because provider errors may contain credentials.
 
-PASS means the archived records agree. It does not independently re-parse or
-re-grade model answers, establish dataset semantics, or verify a provider invoice.
-A failure identifies the first inconsistent check and the stages already passed.
-The command never repairs records or changes a score.
+Retry only exhausted infrastructure failures (the default for `--retry-failed`):
 
-## Publication and historical records
+```powershell
+python -m evaluation --output results/luna-max --retry-failed --timeout 900 --retries 1
+```
 
-`manifests/prepared/`, `runs/`, `.publish/`, `exports/`, legacy result
-directories and `tests/` are ignored by Git. This workflow publishes source
-and instructions by default. To reproduce a study, also supply its prepared
-input bundle and the matching source revision through the chosen archive;
-a source-only checkout does not contain the reviewed data.
+Or select failure labels from the CSV:
 
-Saved evaluation archives remain local under `.publish/`. Retired root-level
-inputs/configurations are archived separately from the active project. The
-maintained runner does not read old runner scripts or caches.
+```powershell
+python -m evaluation --output results/luna-max --retry-failed timeout parse_failure code_format_error
+python -m evaluation --output results/luna-max --retry-failed all
+```
+
+Unknown failure labels are rejected before credentials are read or results are
+changed. With no labels, `--retry-failed` selects API timeouts and provider errors.
+
+The latest result becomes the current row, including if a repeated attempt is
+incorrect. All previous outputs, generated programs, settings, and costs remain
+in both files. A fresh run needs another output basename; existing results are
+never overwritten accidentally.
+If a retry is interrupted, the CSV retains the prior completed result together
+with its matching generated code and execution evidence. The unfinished attempt
+remains in the history.
+
+Client setup or cleanup failures still finalize the session and save the
+checkpoint. Cleanup diagnostics appear in JSON and the CSV's `session_history`;
+completed evaluation results remain available, and the command returns a nonzero
+exit status when cleanup fails.
+
+Worker harness failures, such as failed process cleanup setup, save a completed
+attempt with generated source, raw response, diagnostics, tokens and costs, then
+stop the run with a nonzero exit status. They are excluded from capability
+accuracy. After resolving the worker issue, retry the saved failure explicitly
+with `--retry-failed harness_error`; the earlier attempt remains in the history.
+
+Wrong answers, malformed outputs, and generated-code failures count as incorrect.
+Exhausted API timeouts, provider failures and worker harness failures are excluded from capability accuracy
+and reported separately. The JSON summary also reports correct answers divided
+by all completed evaluations. Costs distinguish reported usage from conservative
+reservations for calls whose usage was not returned.

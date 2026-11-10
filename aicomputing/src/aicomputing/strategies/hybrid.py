@@ -13,7 +13,7 @@ underscores as spaces. This supports snake_case identifiers while avoiding
 matches inside unrelated words.
 
 The selected strategy is recorded in substrategy and in a raw-text prefix.
-The delegated strategy handles generation, parsing, and token-limit retries;
+The delegated strategy handles generation and parsing;
 the runtime handles input checks, output validation, and validation retries.
 """
 
@@ -115,7 +115,7 @@ class HybridStrategy(Strategy):
             return "cot"
 
         # Route selected input shapes to structured-CoT prompting.
-        if _has_complex_inputs(request.inputs):
+        if _matches_cot_input_shapes(request.inputs):
             return "cot"
 
         # Use direct prediction when no routing rule matches.
@@ -138,7 +138,7 @@ class HybridStrategy(Strategy):
         return result
 
 
-def _has_complex_inputs(inputs: Dict[str, Any]) -> bool:
+def _matches_cot_input_shapes(inputs: Dict[str, Any]) -> bool:
     """Match the input-shape heuristics used for CoT routing.
 
     A dictionary input qualifies if an immediate value is a list,
