@@ -1,2 +1,4 @@
 # Preserve the frozen release's exact bytes and SHA256 on every platform.
 data/dataset-release.json -text
+case_study/src/paper_parser/data/*.conll -text
+case_study/src/paper_parser/data/LICENSE -text

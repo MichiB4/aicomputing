@@ -77,6 +77,7 @@ long-lived runtime, opt in with a positive `cache_size`, such as `cache_size=128
 - [Evaluation workflow](evaluation/README.md): run selected benchmarks with one command and receive one detailed CSV and one JSON.
 - [Benchmark reference](docs/evaluation.md): benchmark data, selection and scoring.
 - [Reviewed dataset](data/README.md): bundled release, checksum, provenance and upstream notices.
+- [TDMSci case study](case_study/README.md): application, corpus, evaluation, and annotation-guideline review.
 
 The package's registered strategies are available independently of the subset selected for an experiment.
 
