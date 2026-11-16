@@ -21,7 +21,7 @@ class EvaluationWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.directory = Path(self.temp.name)
+        self.directory = Path(self.temp.name).resolve()
         lock_temp = tempfile.TemporaryDirectory()
         self.addCleanup(lock_temp.cleanup)
         lock_temp_patch = patch("evaluation.runner.tempfile.gettempdir", return_value=lock_temp.name)
@@ -663,7 +663,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_malformed_config_paths_can_be_overridden_by_command_line_paths(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             config = root / "config.json"
             config.write_text(json.dumps(dict(output=[], key_file={}, dataset_release=5)))
             args, settings = read_options(["--config", str(config), "--output", str(root / "run"),
@@ -697,7 +697,7 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_config_paths_and_cli_paths_keep_their_own_base_directories(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             config = root / "config.json"
             config.write_text(json.dumps(dict(output="run", key_file="keys.txt", dataset_release="data.json")))
             args, settings = read_options(["--config", str(config)])

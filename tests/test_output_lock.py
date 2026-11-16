@@ -29,9 +29,10 @@ except ValueError:
 
 class OutputLockTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
+        # Relative path aliases require the same drive as the checkout on Windows.
+        directory = tempfile.TemporaryDirectory(dir=runner.ROOT)
         self.addCleanup(directory.cleanup)
-        self.directory = Path(directory.name)
+        self.directory = Path(directory.name).resolve()
         self.base = self.directory / "results" / "run"
         self.system_temp = self.directory / "system-temp"
         self.system_temp.mkdir()
