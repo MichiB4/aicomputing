@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import re
 
-REVISION = "tdmsci-token-spans-v1"
+REVISION = "tdmsci-token-spans-v2"
 SIGNATURE = "extract_research_entities(tokens: list[str]) -> dict"
 FIELDS = ("tasks", "datasets", "metrics")
 LABELS = dict(zip(FIELDS, ("TASK", "DATASET", "METRIC"), strict=True))
@@ -23,6 +23,16 @@ sentiment classification. datasets are named corpora, benchmarks, or test
 collections. metrics are measures used to assess performance, such as accuracy,
 F1 score, or BLEU. A numerical result alone is not a metric mention.
 
+Follow TDMSci annotation rules: include language resources as datasets. Label
+specific, self-contained mentions; skip anonymous references like "this task".
+Use the shortest span preserving meaning, without determiners. Keep dataset
+head nouns (corpus, dataset, benchmark), but omit task/problem head nouns unless
+essential to a name. Interpret shared-task names by their referent. Include
+higher-level tasks and task mentions used as modifiers. Join adjacent full
+names and abbreviations. Separate complete conjuncts; keep an elliptical
+conjunction together. For nested entities, retain the longest span to match
+the flat CoNLL labels.
+
 Mark the entity itself, omitting surrounding articles and prepositions unless
 they are part of its name. Keep different occurrences as separate spans. One
 token may belong to at most one entity. Use [] when a category is absent.
@@ -40,9 +50,17 @@ class Sentence:
                 or len(self.text) > MAX_TEXT_CHARS or not 1 <= len(self.tokens) <= MAX_TOKENS
                 or len(self.tokens) != len(self.offsets)):
             raise ValueError("Supply one nonempty sentence of at most 2,500 characters")
-        for token, (start, end) in zip(self.tokens, self.offsets, strict=True):
-            if not token or self.text[start:end] != token:
+        previous_end = 0
+        for token, offset in zip(self.tokens, self.offsets, strict=True):
+            if not isinstance(offset, (tuple, list)) or len(offset) != 2:
+                raise ValueError("Token offsets must contain start/end pairs")
+            start, end = offset
+            if (not isinstance(token, str) or not token
+                    or type(start) is not int or type(end) is not int
+                    or not previous_end <= start < end <= len(self.text)
+                    or self.text[start:end] != token):
                 raise ValueError("Token offsets do not match sentence text")
+            previous_end = end
 
     @classmethod
     def from_text(cls, text: str):

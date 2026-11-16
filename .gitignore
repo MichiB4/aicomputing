@@ -1,7 +1,7 @@
 # Workspace-generated files
 .pytest_cache/
 .ruff_cache/
-.venv/
+.venv*/
 __pycache__/
 *.py[cod]
 
@@ -11,19 +11,6 @@ __pycache__/
 !.env.example
 model_configs.json
 model_configs.local.json
-
-# Thesis / paper
-paper_gpt/
-
-# AI/development notes
-.claude/
-CLAUDE.md
-CHANGES_EXPERIMENT.md
-
-# Development/test-only package content
-aicomputing/tests/
-aicomputing/docs/
-aicomputing/smoke_test.py
 
 # Editor / OS
 .vscode/
@@ -35,33 +22,17 @@ Thumbs.db
 # Local project exports
 *.zip
 
-# Local re-root backup files
-pre-reroot-*
-
-# Local evaluation outputs and publication workspace
-/.publish/
-/runs/
-/results/
+# Keep new evaluation outputs local; publish only the reviewed final bundle.
+/results/*
+!/results/README.md
+!/results/final-evaluations-2026-11-16.zip
 /aicomputing/results/
-/exports/
-/scripts/verify_experiment.py
 
 # Include the reviewed release and its documentation; keep other data local.
 /data/*
 !/data/dataset-release.json
 !/data/README.md
 !/data/THIRD_PARTY_NOTICES.txt
-
-# Locally prepared, self-contained experiment inputs
-/manifests/prepared/
-
-# Local-only development and maintenance
-/tests/
-/scripts/
-/.github/
-/pytest.ini
-/ruff.toml
-/archives/
 
 # Packaging and coverage artifacts
 *.egg-info/

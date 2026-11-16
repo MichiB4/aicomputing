@@ -30,7 +30,24 @@ python -m pip install "./aicomputing[openai]"
 python -m pip install "./aicomputing[hf]"
 ```
 
-The OpenAI backend and evaluator require OpenAI SDK 2.30.0 or newer.
+The OpenAI backend and evaluator require OpenAI SDK 2.30.0 or newer within major version 2.
+
+## Development checks
+
+Install both packages and their offline test dependencies from the repository root:
+
+```powershell
+python -m pip install -e "./aicomputing[dev,benchmarks]" -e "./case_study[dev]"
+python -m pytest -q
+python -m ruff check .
+python -m build ./aicomputing
+python -m build ./case_study
+```
+
+Tests cover the runtime, provider adapters, evaluation checkpoints and scoring,
+and the case-study app. Provider calls are mocked; no API keys are required.
+The GitHub Checks workflow runs these checks on Windows and Linux with Python
+3.10 and 3.14. Generated results, caches and build artifacts are ignored.
 
 ## Use the oracle
 
@@ -78,6 +95,7 @@ long-lived runtime, opt in with a positive `cache_size`, such as `cache_size=128
 - [Benchmark reference](docs/evaluation.md): benchmark data, selection and scoring.
 - [Reviewed dataset](data/README.md): bundled release, checksum, provenance and upstream notices.
 - [TDMSci case study](case_study/README.md): application, corpus, evaluation, and annotation-guideline review.
+- [Published results](results/README.md): the four full benchmark experiments and the latest TDMSci v2 case-study run, with checksums and verification notes.
 
 The package's registered strategies are available independently of the subset selected for an experiment.
 
@@ -89,7 +107,7 @@ evaluation/                 # Single-command evaluation and shared helpers
 evaluation/benchmarks/      # Reviewed data, task selection, grading and result rows
 docs/evaluation.md          # Benchmark data and scoring
 data/dataset-release.json   # Bundled reviewed benchmark data
-results/                    # One CSV and JSON per evaluation (local, ignored)
+results/                    # Published result bundle; new raw runs remain local
 ```
 
 ## Status

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from aicomputing.parsing import parse_result
 from aicomputing.status import ParseStatus
@@ -85,18 +86,23 @@ def validate_release(data, *, require_approved=True):
     if require_approved and data["status"] != "approved":
         raise ValueError("Dataset preparation is incomplete: release is not approved for selection")
     policy = data.get("policy", {})
-    if (policy.get("public_examples") != "retained_actual_input_excluded"
+    if (not isinstance(policy, dict)
+            or policy.get("public_examples") != "retained_actual_input_excluded"
             or policy.get("model_outputs_used_for_curation") is not False):
         raise ValueError("Release must retain examples and exclude performance-based curation")
     benches = data.get("benchmarks")
     if not isinstance(benches, dict) or not benches or set(benches) - set(BENCHMARKS):
         raise ValueError("Invalid prepared benchmark inventory")
     for benchmark, inventory in benches.items():
+        if not isinstance(inventory, dict):
+            raise ValueError(f"{benchmark}: inventory must be an object")
         items = inventory.get("items")
         if not isinstance(items, list) or type(inventory.get("source_count")) is not int or inventory["source_count"] != len(items):
             raise ValueError(f"{benchmark}: incomplete source inventory")
         seen = set()
         for item in items:
+            if not isinstance(item, dict):
+                raise ValueError(f"{benchmark}: each item must be an object")
             item_id = item.get("item_id")
             if not isinstance(item_id, str) or not item_id or item_id in seen:
                 raise ValueError(f"{benchmark}: duplicate or invalid item ID")
@@ -104,7 +110,7 @@ def validate_release(data, *, require_approved=True):
             if item.get("review_status") not in ("approved", "quarantined"):
                 raise ValueError(f"{item_id}: unrecorded review decision")
             if item["review_status"] == "quarantined":
-                if not item.get("reason"):
+                if not isinstance(item.get("reason"), str) or not item["reason"].strip():
                     raise ValueError(f"{item_id}: quarantine requires a reason")
                 continue
             _validate_approved_item(benchmark, item)
@@ -115,10 +121,11 @@ def _validate_approved_item(benchmark, item):
     for field in ("signature", "specification", "review_note"):
         if not isinstance(item.get(field), str) or not item[field].strip():
             raise ValueError(f"{item_id}: missing {field}")
-    if not isinstance(item.get("evidence"), list) or not item["evidence"]:
+    if (not isinstance(item.get("evidence"), list) or not item["evidence"]
+            or any(not isinstance(note, str) or not note.strip() for note in item["evidence"])):
         raise ValueError(f"{item_id}: missing semantic review evidence")
     profile = item.get("scoring_profile")
-    if profile not in PROFILES:
+    if not isinstance(profile, str) or profile not in PROFILES:
         raise ValueError(f"{item_id}: unknown scoring profile")
     allowed_profiles = {
         "gsm8k": {"numeric_abs_1e-3"},
@@ -131,12 +138,15 @@ def _validate_approved_item(benchmark, item):
     signature = parse_signature(item["signature"])
     observations = item.get("observations")
     examples = item.get("public_example_input_sha256")
-    if not isinstance(examples, list) or any(not isinstance(value, str) or len(value) != 64 for value in examples):
+    if not isinstance(examples, list) or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in examples):
         raise ValueError(f"{item_id}: missing example coverage ledger")
     if not isinstance(observations, list) or not observations:
         raise ValueError(f"{item_id}: no approved observations")
     ids, inputs_seen = set(), {}
     for observation in observations:
+        if not isinstance(observation, dict) or not {"inputs", "expected"} <= observation.keys():
+            raise ValueError(f"{item_id}: observation requires typed inputs and expected output")
         key = observation.get("invocation_id")
         if not isinstance(key, str) or not key or key in ids:
             raise ValueError(f"{item_id}: duplicate or invalid invocation ID")
@@ -147,7 +157,10 @@ def _validate_approved_item(benchmark, item):
             raise ValueError(f"{item_id}: inputs must be named Python values")
         if set(inputs) != {parameter.name for parameter in signature.params}:
             raise ValueError(f"{item_id}: inputs disagree with declared signature")
-        validate_inputs(signature, inputs)
+        try:
+            validate_inputs(signature, inputs)
+        except TypeError as exc:
+            raise ValueError(f"{item_id}: inputs violate the declared types") from exc
         digest = input_digest(inputs)
         if digest in examples:
             raise ValueError(f"{item_id}: actual input repeats a displayed public example")
@@ -158,7 +171,10 @@ def _validate_approved_item(benchmark, item):
         # Exercise the actual parser/validator rather than inferring a return
         # type from the gold answer. Gold values remain grading-only data.
         parsed = parse_result(frame_answer(format_prompt_value({"result": expected})))
-        validate_output(parsed.value, signature.return_type, strict=True)
+        try:
+            validate_output(parsed.value, signature.return_type, strict=True)
+        except TypeError as exc:
+            raise ValueError(f"{item_id}: target violates the declared return type") from exc
         if parsed.status == ParseStatus.FAILED:
             raise ValueError(f"{item_id}: gold output cannot pass the runtime interface")
         if not compare(parsed.value, expected, profile):

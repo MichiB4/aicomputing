@@ -179,6 +179,8 @@ def configure(supplied, previous=None):
         if settings["temperature"] is not None or settings["top_p"] is not None:
             raise ValueError("Omit temperature and top_p when native reasoning is enabled")
     else:
+        if profile.model == "gpt-6.1-sol":
+            raise ValueError("gpt-6.1-sol requires --reasoning low or higher")
         settings["temperature"] = 0.0 if settings["temperature"] is None else settings["temperature"]
         settings["top_p"] = 1.0 if settings["top_p"] is None else settings["top_p"]
     for name, upper in (("temperature", 2), ("top_p", 1)):

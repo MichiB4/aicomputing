@@ -15,7 +15,7 @@ import random
 from typing import List, Sequence
 
 # Increment when selection or fingerprint rules change.
-SELECTION_ALGORITHM_VERSION = 5
+SELECTION_ALGORITHM_VERSION = 6
 
 
 def _derive_seed(seed: int, *parts: str) -> int:

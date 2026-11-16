@@ -124,7 +124,7 @@ def save(document, output: Path):
                             (".csv", csv_text(document["records"]))):
         target = Path(str(output) + suffix)
         temporary = Path(str(target) + ".tmp")
-        with temporary.open("w", encoding="utf-8", newline="") as stream:
+        with temporary.open("w", encoding="utf-8", errors="backslashreplace", newline="") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())

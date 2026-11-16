@@ -46,8 +46,10 @@ public-example inputs. Expected answers are grading-only data and are not passed
 to the model. The evaluated reference implementation is not supplied to the
 model or used to repair its output.
 
-For MBPP+, reviewed targets originate from aligned published input/output lists.
-The bundled release contains the frozen targets and provenance. Evaluation does
+For MBPP+, 342 approved targets match aligned published input/output lists.
+The remaining approved target (`Mbpp/630`) is specification-reviewed because
+its published script has no precomputed results list. The bundled release
+identifies this source explicitly and contains all frozen targets. Evaluation does
 not run model-generated programs to establish expected answers.
 
 These public benchmark cases are development data, not an unseen holdout.
@@ -76,7 +78,7 @@ structured comparison; MBPP+ uses its reviewed numeric, exact, or set-comparison
 rule; GSM8K uses numeric comparison. Type validation is separate from semantic
 correctness: a structurally valid answer may still be wrong.
 
-Wrong answers, malformed outputs, and generated-code syntax, policy, runtime, or
+Wrong answers, malformed outputs, and generated-code syntax, runtime, or
 execution-timeout failures count as incorrect. Exhausted API timeouts and provider
 failures are reported as infrastructure exclusions. Capability accuracy divides
 correct answers by scorable evaluations. The summary also reports correct answers

@@ -403,7 +403,7 @@ def execute_code(code: str, signature: str, inputs: dict, timeout_seconds=120.0)
                     raise subprocess.TimeoutExpired(process.args, timeout_seconds)
                 process.stdin.write(_WORKER_START_SIGNAL)
                 process.stdin.close()
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                process.wait(timeout=min(timeout_seconds, max(0.0, deadline - time.monotonic())))
             except subprocess.TimeoutExpired:
                 result.update(status="timeout", error_type="TimeoutExpired",
                               error_message=f"Worker exceeded the {timeout_seconds:g}-second timeout.")

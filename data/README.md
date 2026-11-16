@@ -6,11 +6,11 @@ inputs and expected answers, scoring profiles, review notes and quarantine
 decisions. A normal evaluation uses this file directly, without downloading
 datasets or executing reference implementations.
 
-Release: `specification-output-reviewed-mbpp-published-20261030-v2`.
-Size: 4,065,324 bytes. SHA256:
+Release: `specification-output-reviewed-v3`.
+Size: 3,939,750 bytes. SHA256:
 
 ```text
-b961d334453779e42bd4e32df90b71fb2f177ff0be008a0dcc742ba273edff15
+aabacacd3d16c45e74bccadbde1e412fae36b2218d47d607049ddb719ef3e717
 ```
 
 | Benchmark | Source tasks | Approved | Quarantined |
@@ -25,9 +25,14 @@ Dataset and selection fingerprints are recorded separately in each run. See
 the [benchmark reference](../docs/evaluation.md) for grading and MBPP published
 target details.
 
-Historical filesystem paths in the provenance identify original preparation
-artifacts. Evaluations read this self-contained release and do not open those
-paths. Git attributes preserve the release bytes across operating systems.
+MBPP+ has 342 observations matched to published literal targets. The remaining
+approved observation, `Mbpp/630`, is explicitly marked as a specification-reviewed
+target because its published test script has no precomputed output list.
+
+Per-task review rationales are embedded in the release. Provenance uses portable
+source identifiers, checksums and published-target IDs. The release contains
+only data and curation decisions; selection settings belong to the evaluator.
+Git attributes preserve the release bytes across operating systems.
 For a different reviewed release, pass `--dataset-release path/to/release.json`.
 
 ## Sources and notices

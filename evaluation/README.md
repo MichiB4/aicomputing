@@ -6,7 +6,7 @@ First install this checkout in editable mode from the repository root:
 python -m pip install -e "./aicomputing[openai,benchmarks]"
 ```
 
-The evaluator requires OpenAI SDK 2.30.0 or newer.
+The evaluator requires OpenAI SDK 2.30.0 or newer within major version 2.
 The `benchmarks` extra optionally enables system certificates for HTTPS calls.
 Evaluation checks that the imported package comes from this checkout so its
 recorded source hashes describe the code actually used.
@@ -33,7 +33,6 @@ fields are retained in the CSV/JSON outputs.
 Prediction-parsing diagnostics use `parse_status` and `parse_error`. Generated
 code uses `execution_error` and execution details instead; its parsing fields
 are empty. These diagnostics do not change benchmark failure labels or scoring.
-Historical result files retain their original columns and values.
 
 Invalid Unicode in generated source is recorded as a code syntax failure; the
 run continues. JSON and JSON-encoded CSV histories preserve the original text.
@@ -116,7 +115,7 @@ GPT-6.1 Sol requires `--reasoning low` or a higher effort; it does not support `
 
 Token-cap exhaustion is recorded as an invalid output; the runner never silently
 increases the cap. Raw code is compiled and executed through the standard Python
-worker. The current general syntax and semantic code-review prompt is used.
+worker. The source prompt requests syntax and semantic review before submission.
 
 Use `OPENAI_API_KEY` or `CEREBRAS_API_KEY`, or provide a named assignment file with
 `--key-file .env.local`. Local Ollama models require no key. Credentials are not

@@ -35,8 +35,8 @@ Rules mode works without credentials. For AI, set `OPENAI_API_KEY` or
 assignment. `.env.example` documents optional settings; it is not loaded
 automatically. The default is GPT-6.1 Terra, direct strategy, native reasoning
 `none`, strict validation, no cache or automatic retries, and a 120-second
-HTTP phase timeout. The default request omits a provider output-token cap
-because Terra rejects that parameter. Other models must support the requested
+HTTP phase timeout. The default request omits an application output-token cap.
+Other models must support the requested
 settings. The app makes an API call only when **Run AI** is selected.
 
 ## Evaluation
@@ -70,59 +70,25 @@ source hashes. Existing files are not overwritten. Infrastructure failures
 stop the batch after checkpointing the affected case; there are no automatic
 retries or resume operation.
 
+JSON preserves model text exactly. CSV escapes invalid Unicode characters so
+an invalid model response cannot prevent checkpointing the study.
+
 The released v2 files parse into 1,523 training and 487 test sentence blocks,
 though their names and the original article report 1,500/500. Their
 entity counts match the article. The app tokenizes arbitrary pasted text with
 a regular expression; study cases use the corpus's own tokens.
 
-### Recorded 100-sentence run and duplicate sensitivity
+## Extraction specification and dataset limits
 
-The existing paired run used seed 42 and retained 100 sampled test
-rows exactly as released. Its detailed CSV and JSON are stored locally under
-`output/` and are excluded from the GitHub repository. The original 100-row
-scores remain the primary results. The released corpus has repeated token
-sequences within and across splits; counts and annotation conflicts are
-documented in the
-[dataset provenance](src/paper_parser/data/README.md).
+The app and study use the versioned specification in
+[`contract.py`](src/paper_parser/contract.py), based on the authors'
+[annotation guidelines, Appendix A](https://aclanthology.org/2021.eacl-main.59.pdf#page=7).
+It defines entity categories, span boundaries, abbreviations, conjunctions,
+and the flat output schema. Each result records the exact specification and
+its revision.
 
-In the 100-row sample, `T0016` and `T0064` have identical tokens and labels.
-`T0173`, `T0175`, and `T0177` exactly match training sentences, with the same
-gold annotations. For a **sensitivity analysis only**, exclude those three
-training-overlap rows and retain the first occurrence (`T0016`) of the
-within-test pair. This leaves 96
-test sentences. The 96-row scores below were recomputed from the saved 100-row
-predictions; they required no new model calls and do not replace the original
-run. Duplicate identity means exact, case-sensitive ordered token equality.
-
-| Method and set | Precision | Recall | Micro F1 | Exact sentences |
-| --- | ---: | ---: | ---: | ---: |
-| Terra, original 100 | 54.5% | 69.5% | 61.1% | 48/100 (48.0%) |
-| Terra, duplicate sensitivity 96 | 54.8% | 69.9% | 61.4% | 46/96 (47.9%) |
-| Phrase matcher, original 100 | 46.2% | 43.9% | 45.0% | 29/100 (29.0%) |
-| Phrase matcher, duplicate sensitivity 96 | 44.9% | 42.3% | 43.6% | 26/96 (27.1%) |
-
-The small change in Terra's F1 suggests that these four rows do not drive the
-reported result. It does not test whether the public dataset appeared in the
-model's pretraining material. Report the 100-row result first and the 96-row
-calculation as a sensitivity check.
-
-### Specification and annotation guidelines
-
-The model run used the exact `tdmsci-token-spans-v1` specification saved in its
-result JSON and in [`contract.py`](src/paper_parser/contract.py). A review of
-the authors' [annotation guidelines, Appendix A](https://aclanthology.org/2021.eacl-main.59.pdf#page=7)
-found the following alignment and gaps:
-
-| Guideline | Evaluated specification |
-| --- | --- |
-| Identify Task problems, Dataset corpora/resources, and Metric measures in sentences from any paper section. | Broadly aligned. The prompt includes mentions of prior work, but describes datasets as corpora, benchmarks, or test collections without naming language resources. |
-| Annotate factual, content-bearing, self-sufficient mentions; omit anonymous references such as “this task” or “the dataset.” | Not stated. The prompt's “every relevant mention” may encourage extra generic spans. |
-| Choose the minimum meaningful span and omit determiners. Include `corpus`/`dataset`/`benchmark` in a dataset span when it is the head noun; usually omit `task`/`problem` from a task span. | Only the general instruction to omit surrounding articles and prepositions is present. For example, in saved case `T0024` the model marked `neural machine translation`, while the gold span is `machine translation`. The prompt leaves that boundary choice open. |
-| Interpret shared-task names by their actual referent in context and include higher-level tasks. Keep full names with adjacent abbreviations; handle conjunctions and task premodifiers according to the annotation examples. | These decisions are not specified explicitly. |
-| The released CoNLL data keeps the longest entity where original annotations overlap. | The prompt forbids overlapping output, matching the flat CoNLL target, but does not tell the model which span to retain. |
-
-For a future prompt version, explicitly describe those rules and test it in a
-new run. Changing the prompt now would make the saved 100-sentence results no
-longer representative of the current specification. The present F1 measures
-agreement with the released labels under the evaluated prompt; it is not a
-measure of general extraction quality outside this corpus.
+The corpus contains repeated sentences and train/test overlap, including
+conflicting annotations. Counts are documented in the
+[dataset provenance](src/paper_parser/data/README.md). Sampling retains the
+released rows and labels. Scores therefore measure agreement with this corpus;
+they do not establish performance on unseen papers or general extraction quality.

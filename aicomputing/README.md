@@ -162,7 +162,7 @@ The `hf` backend runs `transformers` models locally. A CUDA-capable GPU is stron
 
 ### OpenAI-compatible APIs
 
-Install the `openai` extra above; it requires OpenAI SDK 2.30.0 or newer.
+Install the `openai` extra above; it requires OpenAI SDK 2.30.0 or newer within major version 2.
 
 The `openai` backend works with services exposing a compatible chat-completions API, including hosted providers and local servers such as vLLM or LM Studio. Supply provider credentials through the environment or backend configuration. Keep credentials out of source control.
 
@@ -348,7 +348,7 @@ benchmark-specific outcome labels after receiving this result. Important fields 
 
 A failed or truncated contract check can retain a valid candidate.
 `provider_finish_reason` follows the response supplying the selected answer;
-the `verdict_*` fields describe the checker separately. New evaluation CSV/JSON
+the `verdict_*` fields describe the checker separately. Evaluation CSV/JSON
 rows include both sets of diagnostics without changing correctness or scoring
 eligibility.
 

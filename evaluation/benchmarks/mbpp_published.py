@@ -149,7 +149,7 @@ def assertion(out, exp, atol):
 
 
 def scoring_profile(source):
-    """Recognize the two previously reviewed scorers; never execute them."""
+    """Recognize the two reviewed scoring forms; never execute them."""
     tree = ast.parse(source)
     helpers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
 
@@ -164,7 +164,15 @@ def scoring_profile(source):
     is_unordered = same(helpers.get("assertion"), unordered)
     if not is_unordered and not same(helpers.get("assertion"), ordinary):
         raise ValueError("unreviewed published scoring function")
-    tolerance = tree.body[-1].body[0].value.args[-1]
+    loop = tree.body[-1]
+    if not isinstance(loop, ast.For) or len(loop.body) != 1:
+        raise ValueError("unreviewed published scoring loop")
+    statement = loop.body[0]
+    call = statement.value if isinstance(statement, ast.Expr) else None
+    if (not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name)
+            or call.func.id != "assertion" or len(call.args) != 3):
+        raise ValueError("unreviewed published scoring loop")
+    tolerance = call.args[-1]
     if not isinstance(tolerance, ast.Constant) or type(tolerance.value) not in (int, float):
         raise ValueError("unreviewed published tolerance")
     if tolerance.value not in (0, 0.0001):

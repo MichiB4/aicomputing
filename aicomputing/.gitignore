@@ -7,9 +7,7 @@ dist/
 .venv/
 venv/
 
-# experiment outputs (keep curated results out of version control
-# or commit them deliberately from results/)
+# Local evaluation and tracing outputs
 results/
 traces/
 *.jsonl
-paper/*.pdf

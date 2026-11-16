@@ -228,6 +228,8 @@ def parse_result(text: str, *, unwrap_result: bool = True) -> ParseOutcome:
         value = _decode_framed_literal(payload)
     except _DuplicateField:
         return ParseOutcome(None, ParseStatus.FAILED, "duplicate object key")
+    except RecursionError:
+        return ParseOutcome(None, ParseStatus.FAILED, "final-answer nesting exceeds the supported depth")
     def supported(item):
         if item is None or type(item) in (bool, int, str, bytes):
             return True
@@ -239,7 +241,11 @@ def parse_result(text: str, *, unwrap_result: bool = True) -> ParseOutcome:
             return all(supported(part) for part in item)
         return False
 
-    if value is _MISSING or not supported(value):
+    try:
+        literal_supported = value is not _MISSING and supported(value)
+    except RecursionError:
+        return ParseOutcome(None, ParseStatus.FAILED, "final-answer nesting exceeds the supported depth")
+    if not literal_supported:
         recovered = _recover_result_text(payload, unwrap_result=unwrap_result)
         if recovered is not None:
             return recovered

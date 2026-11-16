@@ -46,7 +46,7 @@ _PROFILES = {
         cached_input_rate=Decimal("0.01") / 1_000_000,
         cache_write_rate=Decimal("0.125") / 1_000_000,
         output_rate=Decimal("0.50") / 1_000_000,
-        price_checked_date="2026-10-26",
+        price_checked_date="2026-11-16",
     ),
     "gpt-6.1-terra": ModelProfile(
         model="gpt-6.1-terra",
@@ -54,7 +54,7 @@ _PROFILES = {
         cached_input_rate=Decimal("0.05") / 1_000_000,
         cache_write_rate=Decimal("1.25") / 1_000_000,
         output_rate=Decimal("5.00") / 1_000_000,
-        price_checked_date="2026-10-30",
+        price_checked_date="2026-11-16",
     ),
     "gpt-6.1-sol": ModelProfile(
         model="gpt-6.1-sol",
@@ -62,7 +62,7 @@ _PROFILES = {
         cached_input_rate=Decimal("0.10") / 1_000_000,
         cache_write_rate=Decimal("2.50") / 1_000_000,
         output_rate=Decimal("10.00") / 1_000_000,
-        price_checked_date="2026-11-10",
+        price_checked_date="2026-11-16",
     ),
     "qwen-3.8-27b": ModelProfile(
         model="qwen-3.8-27b",
@@ -70,7 +70,7 @@ _PROFILES = {
         cached_input_rate=Decimal("0.99") / 1_000_000,
         cache_write_rate=Decimal("0.99") / 1_000_000,
         output_rate=Decimal("1.49") / 1_000_000,
-        price_checked_date="2026-10-30",
+        price_checked_date="2026-11-16",
         output_reservation=32_768, max_input_reservation=65_536,
         provider="cerebras", api_base="https://api.cerebras.ai/v1",
         key_env="CEREBRAS_API_KEY", price_source="https://api.cerebras.ai/public/v1/models",

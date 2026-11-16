@@ -89,12 +89,8 @@ def _resolve(task, seed: int) -> ResolvedItem:
 
 
 def content_fingerprint(item: ResolvedItem) -> str:
-    """Hash the specification, inputs and expected output.
-
-    The None slot keeps fingerprints comparable with results recorded while
-    items still carried a category.
-    """
-    payload = canonical_json([item.signature, item.docstring, None, item.inputs, item.expected])
+    """Hash the specification, inputs and expected output."""
+    payload = canonical_json([item.signature, item.docstring, item.inputs, item.expected])
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 

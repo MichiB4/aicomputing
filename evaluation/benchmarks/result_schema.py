@@ -6,7 +6,7 @@ Unavailable token usage remains unknown.
 
 Paired analysis requires matching inputs and settings. retries combines
 validation and recorded API retries.
-Historical files keep their original schema."""
+"""
 
 from __future__ import annotations
 
@@ -19,11 +19,10 @@ from aicomputing.types import parse_signature
 from aicomputing.validation import validate_output
 
 # These labels and accuracy rules belong to evaluation, not execution results.
-# policy_rejected remains recognized when reading historical worker results.
 SEMANTIC_WRONG_ANSWER = "semantic_wrong_answer"
 REFERENCE_TYPE_MISMATCH = "reference_type_mismatch"
 _CODE_FAILURES = frozenset("code_" + status for status in (
-    "format_error", "syntax_error", "policy_rejected", "runtime_error",
+    "format_error", "syntax_error", "runtime_error",
     "serialization_error", "timeout",
 ))
 _OUTPUT_FAILURES = frozenset({
@@ -52,7 +51,7 @@ def is_scorable(failure_type: str | None) -> bool:
     raise ValueError(f"Unknown failure type: {failure_type!r}")
 
 # Canonical column order for newly written CSV files.
-# Consumers should address columns by name; older files may use an earlier schema.
+# Consumers should address columns by name.
 RESULT_COLUMNS: List[str] = [
     "run_id",
     "model",
